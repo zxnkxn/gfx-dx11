@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="cube-renderer/cube-renderer.vcxproj" Id="897677c6-5db2-4652-a6c9-c62dda73c359" />
+</Solution>
