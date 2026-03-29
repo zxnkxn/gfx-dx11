@@ -1,6 +1,6 @@
 #include <windows.h>
-#include <iostream>
-#include <fstream>
+#include <cwchar>
+
 #include "renderer.h"
 
 // Global renderer instance
@@ -13,27 +13,20 @@ int WINAPI WinMain(
     _In_ LPSTR lpCmdLine,
     _In_ int nCmdShow)
 {
-    // Check if shader files exist
-    std::ifstream vsFile("src/shaders/vertex_shader.hlsl");
-    std::ifstream psFile("src/shaders/pixel_shader.hlsl");
-
-    if (!vsFile.is_open()) {
-        MessageBox(nullptr, L"Vertex shader file not found!", L"Error", MB_OK | MB_ICONERROR);
-        return 1;
-    }
-    vsFile.close();
-
-    if (!psFile.is_open()) {
-        MessageBox(nullptr, L"Pixel shader file not found!", L"Error", MB_OK | MB_ICONERROR);
-        return 1;
-    }
-    psFile.close();
+    UNREFERENCED_PARAMETER(hPrevInstance);
+    UNREFERENCED_PARAMETER(lpCmdLine);
 
     // Initialize the renderer
-    HRESULT hr = g_renderer.Initialize(hInstance, nCmdShow);
+    const HRESULT hr = g_renderer.Initialize(hInstance, nCmdShow);
     if (FAILED(hr))
     {
-        MessageBox(nullptr, L"Failed to initialize DirectX renderer", L"Error", MB_OK | MB_ICONERROR);
+        wchar_t message[256] = {};
+        swprintf_s(
+            message,
+            L"Failed to initialize DirectX renderer.\nHRESULT: 0x%08X",
+            static_cast<unsigned int>(hr));
+
+        MessageBox(nullptr, message, L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
 

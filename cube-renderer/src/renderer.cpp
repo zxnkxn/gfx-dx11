@@ -1,18 +1,85 @@
 #include "renderer.h"
-#include <cassert>
-#include <comdef.h>
-#include <iostream>
-#include <fstream>
+
+#include <d3d11sdklayers.h>
+#include <filesystem>
+#include <string_view>
+#include <system_error>
+#include <vector>
 
 // Helper macro for HRESULT checking with error output
 #define DXCall(x) \
     do { \
-        HRESULT hr = (x); \
-        if (FAILED(hr)) { \
-            OutputDebugString(L"DirectX call failed: " L#x L"\n"); \
-            return hr; \
+        const HRESULT dxCallHr = (x); \
+        if (FAILED(dxCallHr)) { \
+            OutputDebugStringA("DirectX call failed: " #x "\n"); \
+            return dxCallHr; \
         } \
     } while(0)
+
+namespace
+{
+    namespace fs = std::filesystem;
+
+    template <typename T>
+    void SafeRelease(T*& resource) noexcept
+    {
+        if (resource != nullptr)
+        {
+            resource->Release();
+            resource = nullptr;
+        }
+    }
+
+    void SetDebugName(ID3D11DeviceChild* resource, std::string_view name) noexcept
+    {
+        if (resource != nullptr && !name.empty())
+        {
+            resource->SetPrivateData(
+                WKPDID_D3DDebugObjectName,
+                static_cast<UINT>(name.size()),
+                name.data());
+        }
+    }
+
+    void SetDebugName(IDXGIObject* resource, std::string_view name) noexcept
+    {
+        if (resource != nullptr && !name.empty())
+        {
+            resource->SetPrivateData(
+                WKPDID_D3DDebugObjectName,
+                static_cast<UINT>(name.size()),
+                name.data());
+        }
+    }
+
+    fs::path GetExecutableDirectory()
+    {
+        std::wstring modulePath(MAX_PATH, L'\0');
+
+        while (true)
+        {
+            const DWORD length = GetModuleFileNameW(nullptr, modulePath.data(), static_cast<DWORD>(modulePath.size()));
+            if (length == 0)
+            {
+                return {};
+            }
+
+            if (length < modulePath.size() - 1)
+            {
+                modulePath.resize(length);
+                return fs::path(modulePath).parent_path();
+            }
+
+            modulePath.resize(modulePath.size() * 2);
+        }
+    }
+
+    bool FileExists(const fs::path& path)
+    {
+        std::error_code errorCode;
+        return fs::is_regular_file(path, errorCode);
+    }
+}
 
 // Vertex structure
 struct Vertex
@@ -35,6 +102,7 @@ Renderer::Renderer() :
     m_depthStencilView(nullptr),
     m_rasterizerState(nullptr),
     m_depthStencilState(nullptr),
+    m_annotation(nullptr),
     m_vertexShader(nullptr),
     m_pixelShader(nullptr),
     m_inputLayout(nullptr),
@@ -77,7 +145,7 @@ HRESULT Renderer::Initialize(HINSTANCE hInstance, int nCmdShow)
 
     // Create window
     OutputDebugString(L"Creating application window...\n");
-    hr = CreateAppWindow(hInstance, nCmdShow);
+    hr = CreateAppWindow(hInstance);
     if (FAILED(hr)) {
         OutputDebugString(L"Failed to create application window\n");
         return hr;
@@ -136,18 +204,28 @@ HRESULT Renderer::RegisterWindowClass(HINSTANCE hInstance)
 
     if (!RegisterClassEx(&wcex))
     {
-        DWORD error = GetLastError();
+        const DWORD error = GetLastError();
+        if (error == ERROR_CLASS_ALREADY_EXISTS)
+        {
+            return S_OK;
+        }
+
         OutputDebugString((L"Failed to register window class. Error: " + std::to_wstring(error) + L"\n").c_str());
-        return E_FAIL;
+        return HRESULT_FROM_WIN32(error);
     }
 
     return S_OK;
 }
 
-HRESULT Renderer::CreateAppWindow(HINSTANCE hInstance, int nCmdShow)
+HRESULT Renderer::CreateAppWindow(HINSTANCE hInstance)
 {
     RECT rc = { 0, 0, (LONG)m_width, (LONG)m_height };
-    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+    if (!AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE))
+    {
+        const DWORD error = GetLastError();
+        OutputDebugString((L"Failed to adjust window rect. Error: " + std::to_wstring(error) + L"\n").c_str());
+        return HRESULT_FROM_WIN32(error);
+    }
 
     m_hwnd = CreateWindow(
         L"DirectX11CubeClass",
@@ -164,13 +242,20 @@ HRESULT Renderer::CreateAppWindow(HINSTANCE hInstance, int nCmdShow)
 
     if (!m_hwnd)
     {
-        DWORD error = GetLastError();
+        const DWORD error = GetLastError();
         OutputDebugString((L"Failed to create window. Error: " + std::to_wstring(error) + L"\n").c_str());
-        return E_FAIL;
+        return HRESULT_FROM_WIN32(error);
     }
 
     // Set window user data to this instance
+    SetLastError(ERROR_SUCCESS);
     SetWindowLongPtr(m_hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+    const DWORD error = GetLastError();
+    if (error != ERROR_SUCCESS)
+    {
+        OutputDebugString((L"Failed to set window user data. Error: " + std::to_wstring(error) + L"\n").c_str());
+        return HRESULT_FROM_WIN32(error);
+    }
 
     return S_OK;
 }
@@ -182,7 +267,7 @@ HRESULT Renderer::InitializeDirectX()
 #ifdef _DEBUG
     createDeviceFlags |= D3D11_CREATE_DEVICE_DEBUG;
     m_debugLayerEnabled = true;
-    OutputDebugString(L"Debug layer enabled\n");
+    OutputDebugString(L"Debug layer requested\n");
 #endif
 
     // Driver types
@@ -208,7 +293,7 @@ HRESULT Renderer::InitializeDirectX()
     // Try to create device with different driver types
     for (UINT driverTypeIndex = 0; driverTypeIndex < numDriverTypes; driverTypeIndex++)
     {
-        D3D_DRIVER_TYPE driverType = driverTypes[driverTypeIndex];
+        const D3D_DRIVER_TYPE driverType = driverTypes[driverTypeIndex];
         OutputDebugString((L"Trying to create device with driver type: " + std::to_wstring(driverTypeIndex) + L"\n").c_str());
 
         hr = D3D11CreateDevice(
@@ -222,6 +307,28 @@ HRESULT Renderer::InitializeDirectX()
             &m_device,
             nullptr,
             &m_deviceContext);
+
+#ifdef _DEBUG
+        if (hr == DXGI_ERROR_SDK_COMPONENT_MISSING && (createDeviceFlags & D3D11_CREATE_DEVICE_DEBUG) != 0)
+        {
+            OutputDebugString(L"DirectX debug layer is not installed. Retrying without it.\n");
+            m_debugLayerEnabled = false;
+            SafeRelease(m_device);
+            SafeRelease(m_deviceContext);
+
+            hr = D3D11CreateDevice(
+                nullptr,
+                driverType,
+                nullptr,
+                createDeviceFlags & ~D3D11_CREATE_DEVICE_DEBUG,
+                featureLevels,
+                numFeatureLevels,
+                D3D11_SDK_VERSION,
+                &m_device,
+                nullptr,
+                &m_deviceContext);
+        }
+#endif
 
         if (SUCCEEDED(hr))
         {
@@ -238,6 +345,25 @@ HRESULT Renderer::InitializeDirectX()
     {
         OutputDebugString(L"Failed to create device with any driver type\n");
         return hr;
+    }
+
+#ifdef _DEBUG
+    if (m_debugLayerEnabled)
+    {
+        ID3D11InfoQueue* infoQueue = nullptr;
+        if (SUCCEEDED(m_device->QueryInterface(IID_PPV_ARGS(&infoQueue))))
+        {
+            infoQueue->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_CORRUPTION, TRUE);
+            infoQueue->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_ERROR, TRUE);
+            SafeRelease(infoQueue);
+        }
+    }
+#endif
+
+    if (FAILED(m_deviceContext->QueryInterface(IID_PPV_ARGS(&m_annotation))))
+    {
+        m_annotation = nullptr;
+        OutputDebugString(L"ID3DUserDefinedAnnotation is not available on this device context.\n");
     }
 
     // Create swap chain
@@ -287,6 +413,7 @@ HRESULT Renderer::InitializeDirectX()
         OutputDebugString(L"Failed to create rasterizer state\n");
         return hr;
     }
+    SetDebugName(m_rasterizerState, "MainRasterizerState");
     m_deviceContext->RSSetState(m_rasterizerState);
 
     // Create depth stencil state
@@ -302,6 +429,7 @@ HRESULT Renderer::InitializeDirectX()
         OutputDebugString(L"Failed to create depth stencil state\n");
         return hr;
     }
+    SetDebugName(m_depthStencilState, "MainDepthStencilState");
     m_deviceContext->OMSetDepthStencilState(m_depthStencilState, 1);
 
     OutputDebugString(L"DirectX initialized successfully\n");
@@ -338,12 +466,16 @@ HRESULT Renderer::CreateSwapChain()
     HRESULT hr = dxgiFactory->CreateSwapChain(m_device, &swapChainDesc, &m_swapChain);
 
     // Release temporary interfaces
-    if (dxgiDevice) dxgiDevice->Release();
-    if (dxgiAdapter) dxgiAdapter->Release();
-    if (dxgiFactory) dxgiFactory->Release();
+    SafeRelease(dxgiDevice);
+    SafeRelease(dxgiAdapter);
+    SafeRelease(dxgiFactory);
 
     if (FAILED(hr)) {
         OutputDebugString((L"Failed to create swap chain. HRESULT: " + std::to_wstring(hr) + L"\n").c_str());
+    }
+    else
+    {
+        SetDebugName(m_swapChain, "MainSwapChain");
     }
 
     return hr;
@@ -361,24 +493,14 @@ HRESULT Renderer::CreateRenderTargetView()
     HRESULT hr = m_device->CreateRenderTargetView(backBuffer, nullptr, &m_renderTargetView);
 
     // Set name for back buffer for RenderDoc
-#ifdef _DEBUG
-    if (backBuffer)
-    {
-        backBuffer->SetPrivateData(WKPDID_D3DDebugObjectName, 9, "BackBuffer");
-    }
-#endif
+    SetDebugName(backBuffer, "BackBuffer");
 
-    backBuffer->Release();
+    SafeRelease(backBuffer);
 
     if (SUCCEEDED(hr))
     {
         // Set name for render target view for RenderDoc
-#ifdef _DEBUG
-        if (m_renderTargetView)
-        {
-            m_renderTargetView->SetPrivateData(WKPDID_D3DDebugObjectName, 15, "RenderTargetView");
-        }
-#endif
+        SetDebugName(m_renderTargetView, "RenderTargetView");
     }
     else
     {
@@ -421,17 +543,8 @@ HRESULT Renderer::CreateDepthStencilBuffer()
     hr = m_device->CreateDepthStencilView(m_depthStencilBuffer, &depthStencilViewDesc, &m_depthStencilView);
 
     // Set name for depth stencil buffer for RenderDoc
-#ifdef _DEBUG
-    if (m_depthStencilBuffer)
-    {
-        m_depthStencilBuffer->SetPrivateData(WKPDID_D3DDebugObjectName, 17, "DepthStencilBuffer");
-    }
-
-    if (m_depthStencilView)
-    {
-        m_depthStencilView->SetPrivateData(WKPDID_D3DDebugObjectName, 15, "DepthStencilView");
-    }
-#endif
+    SetDebugName(m_depthStencilBuffer, "DepthStencilBuffer");
+    SetDebugName(m_depthStencilView, "DepthStencilView");
 
     if (FAILED(hr)) {
         OutputDebugString((L"Failed to create depth stencil view. HRESULT: " + std::to_wstring(hr) + L"\n").c_str());
@@ -445,6 +558,7 @@ void Renderer::CreateViewport()
     OutputDebugString(L"Setting up viewport...\n");
     // Setup the viewport
     D3D11_VIEWPORT vp;
+    ZeroMemory(&vp, sizeof(vp));
     vp.Width = (FLOAT)m_width;
     vp.Height = (FLOAT)m_height;
     vp.MinDepth = 0.0f;
@@ -454,7 +568,7 @@ void Renderer::CreateViewport()
     m_deviceContext->RSSetViewports(1, &vp);
 }
 
-HRESULT Renderer::CompileShader(const std::string& shaderFile, const std::string& entryPoint,
+HRESULT Renderer::CompileShader(const std::wstring& shaderFile, const std::string& entryPoint,
     const std::string& shaderModel, ID3DBlob** blobOut)
 {
     DWORD shaderFlags = D3DCOMPILE_ENABLE_STRICTNESS;
@@ -463,11 +577,9 @@ HRESULT Renderer::CompileShader(const std::string& shaderFile, const std::string
     shaderFlags |= D3DCOMPILE_SKIP_OPTIMIZATION;
 #endif
 
-
-
     ID3DBlob* errorBlob = nullptr;
     HRESULT hr = D3DCompileFromFile(
-        std::wstring(shaderFile.begin(), shaderFile.end()).c_str(),
+        shaderFile.c_str(),
         nullptr,
         D3D_COMPILE_STANDARD_FILE_INCLUDE,
         entryPoint.c_str(),
@@ -482,26 +594,99 @@ HRESULT Renderer::CompileShader(const std::string& shaderFile, const std::string
         if (errorBlob)
         {
             OutputDebugStringA((char*)errorBlob->GetBufferPointer());
-            errorBlob->Release();
+            SafeRelease(errorBlob);
         }
-        OutputDebugString((L"Failed to compile shader: " + std::wstring(shaderFile.begin(), shaderFile.end()) + L"\n").c_str());
+        OutputDebugString((L"Failed to compile shader: " + shaderFile + L"\n").c_str());
         return hr;
     }
 
     if (errorBlob)
     {
-        errorBlob->Release();
+        SafeRelease(errorBlob);
     }
 
     return S_OK;
 }
 
+HRESULT Renderer::LoadShaderBlob(const wchar_t* compiledShaderName, const wchar_t* sourceRelativePath,
+    const char* entryPoint, const char* shaderModel, ID3DBlob** blobOut)
+{
+    if (blobOut == nullptr)
+    {
+        return E_POINTER;
+    }
+
+    *blobOut = nullptr;
+
+    const fs::path executableDirectory = GetExecutableDirectory();
+
+    std::error_code errorCode;
+    const fs::path currentDirectory = fs::current_path(errorCode);
+
+    std::vector<fs::path> compiledShaderCandidates;
+    compiledShaderCandidates.emplace_back(executableDirectory / compiledShaderName);
+
+    if (!currentDirectory.empty())
+    {
+        compiledShaderCandidates.emplace_back(currentDirectory / compiledShaderName);
+    }
+
+    for (const fs::path& shaderPath : compiledShaderCandidates)
+    {
+        if (!FileExists(shaderPath))
+        {
+            continue;
+        }
+
+        const HRESULT hr = D3DReadFileToBlob(shaderPath.c_str(), blobOut);
+        if (SUCCEEDED(hr))
+        {
+            OutputDebugString((L"Loaded compiled shader: " + shaderPath.wstring() + L"\n").c_str());
+            return S_OK;
+        }
+    }
+
+    std::vector<fs::path> sourceShaderCandidates;
+    if (!currentDirectory.empty())
+    {
+        sourceShaderCandidates.emplace_back(currentDirectory / sourceRelativePath);
+        sourceShaderCandidates.emplace_back(currentDirectory / L"cube-renderer" / sourceRelativePath);
+    }
+
+    sourceShaderCandidates.emplace_back(executableDirectory / sourceRelativePath);
+
+    const fs::path twoLevelsUp = executableDirectory.parent_path().parent_path();
+    if (!twoLevelsUp.empty())
+    {
+        sourceShaderCandidates.emplace_back(twoLevelsUp / sourceRelativePath);
+        sourceShaderCandidates.emplace_back(twoLevelsUp / L"cube-renderer" / sourceRelativePath);
+    }
+
+    for (const fs::path& shaderPath : sourceShaderCandidates)
+    {
+        if (!FileExists(shaderPath))
+        {
+            continue;
+        }
+
+        return CompileShader(shaderPath.wstring(), entryPoint, shaderModel, blobOut);
+    }
+
+    OutputDebugString((L"Could not locate shader source or bytecode for: " + std::wstring(sourceRelativePath) + L"\n").c_str());
+    return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+}
+
 HRESULT Renderer::CreateShaders()
 {
     // Compile vertex shader
-    OutputDebugString(L"Compiling vertex shader...\n");
+    OutputDebugString(L"Loading vertex shader...\n");
     ID3DBlob* vertexShaderBlob = nullptr;
-    HRESULT hr = CompileShader("src/shaders/vertex_shader.hlsl", "VS", "vs_5_0", &vertexShaderBlob);
+    HRESULT hr = LoadShaderBlob(
+        L"vertex_shader.cso",
+        L"src\\shaders\\vertex_shader.hlsl",
+        "VS",
+        "vs_5_0",
+        &vertexShaderBlob);
     if (FAILED(hr)) {
         OutputDebugString(L"Failed to compile vertex shader\n");
         return hr;
@@ -516,17 +701,12 @@ HRESULT Renderer::CreateShaders()
         &m_vertexShader);
     if (FAILED(hr)) {
         OutputDebugString(L"Failed to create vertex shader\n");
-        vertexShaderBlob->Release();
+        SafeRelease(vertexShaderBlob);
         return hr;
     }
 
     // Set name for vertex shader for RenderDoc
-#ifdef _DEBUG
-    if (m_vertexShader)
-    {
-        m_vertexShader->SetPrivateData(WKPDID_D3DDebugObjectName, 12, "VertexShader");
-    }
-#endif
+    SetDebugName(m_vertexShader, "VertexShader");
 
     // Define input layout
     D3D11_INPUT_ELEMENT_DESC layout[] =
@@ -546,28 +726,25 @@ HRESULT Renderer::CreateShaders()
         &m_inputLayout);
     if (FAILED(hr)) {
         OutputDebugString(L"Failed to create input layout\n");
-        vertexShaderBlob->Release();
+        SafeRelease(vertexShaderBlob);
         return hr;
     }
 
     // Set name for input layout for RenderDoc
-#ifdef _DEBUG
-    if (m_inputLayout)
-    {
-        m_inputLayout->SetPrivateData(WKPDID_D3DDebugObjectName, 11, "InputLayout");
-    }
-#endif
+    SetDebugName(m_inputLayout, "InputLayout");
 
     // Release vertex shader blob
-    if (vertexShaderBlob)
-    {
-        vertexShaderBlob->Release();
-    }
+    SafeRelease(vertexShaderBlob);
 
     // Compile pixel shader
-    OutputDebugString(L"Compiling pixel shader...\n");
+    OutputDebugString(L"Loading pixel shader...\n");
     ID3DBlob* pixelShaderBlob = nullptr;
-    hr = CompileShader("src/shaders/pixel_shader.hlsl", "PS", "ps_5_0", &pixelShaderBlob);
+    hr = LoadShaderBlob(
+        L"pixel_shader.cso",
+        L"src\\shaders\\pixel_shader.hlsl",
+        "PS",
+        "ps_5_0",
+        &pixelShaderBlob);
     if (FAILED(hr)) {
         OutputDebugString(L"Failed to compile pixel shader\n");
         return hr;
@@ -582,23 +759,15 @@ HRESULT Renderer::CreateShaders()
         &m_pixelShader);
     if (FAILED(hr)) {
         OutputDebugString(L"Failed to create pixel shader\n");
-        pixelShaderBlob->Release();
+        SafeRelease(pixelShaderBlob);
         return hr;
     }
 
     // Set name for pixel shader for RenderDoc
-#ifdef _DEBUG
-    if (m_pixelShader)
-    {
-        m_pixelShader->SetPrivateData(WKPDID_D3DDebugObjectName, 11, "PixelShader");
-    }
-#endif
+    SetDebugName(m_pixelShader, "PixelShader");
 
     // Release pixel shader blob
-    if (pixelShaderBlob)
-    {
-        pixelShaderBlob->Release();
-    }
+    SafeRelease(pixelShaderBlob);
 
     OutputDebugString(L"Shaders created successfully\n");
     return S_OK;
@@ -616,12 +785,7 @@ HRESULT Renderer::CreateConstantBuffer()
     HRESULT hr = m_device->CreateBuffer(&bufferDesc, nullptr, &m_constantBuffer);
 
     // Set name for constant buffer for RenderDoc
-#ifdef _DEBUG
-    if (m_constantBuffer)
-    {
-        m_constantBuffer->SetPrivateData(WKPDID_D3DDebugObjectName, 13, "ConstantBuffer");
-    }
-#endif
+    SetDebugName(m_constantBuffer, "ConstantBuffer");
 
     if (FAILED(hr)) {
         OutputDebugString((L"Failed to create constant buffer. HRESULT: " + std::to_wstring(hr) + L"\n").c_str());
@@ -694,12 +858,7 @@ HRESULT Renderer::CreateCubeGeometry()
     }
 
     // Set name for vertex buffer for RenderDoc
-#ifdef _DEBUG
-    if (m_vertexBuffer)
-    {
-        m_vertexBuffer->SetPrivateData(WKPDID_D3DDebugObjectName, 11, "VertexBuffer");
-    }
-#endif
+    SetDebugName(m_vertexBuffer, "VertexBuffer");
 
     // Define indices for a cube
     UINT indices[] =
@@ -748,12 +907,7 @@ HRESULT Renderer::CreateCubeGeometry()
     hr = m_device->CreateBuffer(&indexBufferDesc, &indexData, &m_indexBuffer);
 
     // Set name for index buffer for RenderDoc
-#ifdef _DEBUG
-    if (m_indexBuffer)
-    {
-        m_indexBuffer->SetPrivateData(WKPDID_D3DDebugObjectName, 10, "IndexBuffer");
-    }
-#endif
+    SetDebugName(m_indexBuffer, "IndexBuffer");
 
     if (FAILED(hr)) {
         OutputDebugString((L"Failed to create index buffer. HRESULT: " + std::to_wstring(hr) + L"\n").c_str());
@@ -783,6 +937,16 @@ void Renderer::UpdateConstantBuffer()
 
 void Renderer::Render()
 {
+    if (m_deviceContext == nullptr ||
+        m_swapChain == nullptr ||
+        m_renderTargetView == nullptr ||
+        m_depthStencilView == nullptr)
+    {
+        return;
+    }
+
+    BeginEvent(L"Frame");
+
     // Clear back buffer
     float clearColor[4] = { 0.0f, 0.125f, 0.3f, 1.0f };
     m_deviceContext->ClearRenderTargetView(m_renderTargetView, clearColor);
@@ -818,40 +982,40 @@ void Renderer::Render()
     m_deviceContext->VSSetConstantBuffers(0, 1, &m_constantBuffer);
 
     // Draw cube
+    BeginEvent(L"DrawCube");
     m_deviceContext->DrawIndexed(m_indexCount, 0, 0);
+    EndEvent();
 
     // Present back buffer
-    m_swapChain->Present(0, 0);
+    const HRESULT hr = m_swapChain->Present(0, 0);
+    if (FAILED(hr))
+    {
+        OutputDebugString((L"Present failed. HRESULT: " + std::to_wstring(hr) + L"\n").c_str());
+    }
+
+    EndEvent();
 }
 
 void Renderer::ResizeSwapChain(UINT width, UINT height)
 {
     if (m_swapChain && width > 0 && height > 0)
     {
+        m_deviceContext->OMSetRenderTargets(0, nullptr, nullptr);
+        m_deviceContext->ClearState();
+        m_deviceContext->Flush();
+
         // Release previous render target view
-        if (m_renderTargetView)
-        {
-            m_renderTargetView->Release();
-            m_renderTargetView = nullptr;
-        }
+        SafeRelease(m_renderTargetView);
 
         // Release previous depth stencil view and buffer
-        if (m_depthStencilView)
-        {
-            m_depthStencilView->Release();
-            m_depthStencilView = nullptr;
-        }
-
-        if (m_depthStencilBuffer)
-        {
-            m_depthStencilBuffer->Release();
-            m_depthStencilBuffer = nullptr;
-        }
+        SafeRelease(m_depthStencilView);
+        SafeRelease(m_depthStencilBuffer);
 
         // Resize swap chain
-        HRESULT hr = m_swapChain->ResizeBuffers(1, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+        const HRESULT hr = m_swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
         if (FAILED(hr))
         {
+            OutputDebugString((L"ResizeBuffers failed. HRESULT: " + std::to_wstring(hr) + L"\n").c_str());
             return;
         }
 
@@ -860,13 +1024,22 @@ void Renderer::ResizeSwapChain(UINT width, UINT height)
         m_height = height;
 
         // Recreate render target view
-        CreateRenderTargetView();
+        if (FAILED(CreateRenderTargetView()))
+        {
+            return;
+        }
 
         // Recreate depth stencil buffer and view
-        CreateDepthStencilBuffer();
+        if (FAILED(CreateDepthStencilBuffer()))
+        {
+            return;
+        }
 
         // Update viewport
         CreateViewport();
+
+        m_deviceContext->RSSetState(m_rasterizerState);
+        m_deviceContext->OMSetDepthStencilState(m_depthStencilState, 1);
     }
 }
 
@@ -882,25 +1055,34 @@ void Renderer::HandleMessages()
 
 void Renderer::Cleanup()
 {
+    if (m_deviceContext != nullptr)
+    {
+        m_deviceContext->ClearState();
+        m_deviceContext->Flush();
+    }
+
     // Release all DirectX resources
-    if (m_vertexBuffer) m_vertexBuffer->Release();
-    if (m_indexBuffer) m_indexBuffer->Release();
-    if (m_constantBuffer) m_constantBuffer->Release();
-    if (m_inputLayout) m_inputLayout->Release();
-    if (m_vertexShader) m_vertexShader->Release();
-    if (m_pixelShader) m_pixelShader->Release();
-    if (m_depthStencilState) m_depthStencilState->Release();
-    if (m_rasterizerState) m_rasterizerState->Release();
-    if (m_depthStencilView) m_depthStencilView->Release();
-    if (m_depthStencilBuffer) m_depthStencilBuffer->Release();
-    if (m_renderTargetView) m_renderTargetView->Release();
-    if (m_swapChain) m_swapChain->Release();
-    if (m_deviceContext) m_deviceContext->Release();
-    if (m_device) m_device->Release();
+    SafeRelease(m_vertexBuffer);
+    SafeRelease(m_indexBuffer);
+    SafeRelease(m_constantBuffer);
+    SafeRelease(m_inputLayout);
+    SafeRelease(m_vertexShader);
+    SafeRelease(m_pixelShader);
+    SafeRelease(m_annotation);
+    SafeRelease(m_depthStencilState);
+    SafeRelease(m_rasterizerState);
+    SafeRelease(m_depthStencilView);
+    SafeRelease(m_depthStencilBuffer);
+    SafeRelease(m_renderTargetView);
+    SafeRelease(m_swapChain);
+    SafeRelease(m_deviceContext);
+    SafeRelease(m_device);
 }
 
 LRESULT CALLBACK Renderer::WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    UNREFERENCED_PARAMETER(wParam);
+
     Renderer* app = reinterpret_cast<Renderer*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
 
     switch (message)
@@ -918,4 +1100,20 @@ LRESULT CALLBACK Renderer::WindowProc(HWND hwnd, UINT message, WPARAM wParam, LP
     }
 
     return DefWindowProc(hwnd, message, wParam, lParam);
+}
+
+void Renderer::BeginEvent(const wchar_t* name) const
+{
+    if (m_annotation != nullptr && name != nullptr)
+    {
+        m_annotation->BeginEvent(name);
+    }
+}
+
+void Renderer::EndEvent() const
+{
+    if (m_annotation != nullptr)
+    {
+        m_annotation->EndEvent();
+    }
 }

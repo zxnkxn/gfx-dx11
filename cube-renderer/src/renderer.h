@@ -1,16 +1,16 @@
 #pragma once
 
 #include <windows.h>
-#include <d3d11.h>
+#include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <directxmath.h>
-#include <vector>
 #include <string>
 
 // Include the DirectX libraries
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "dxguid.lib")
 
 using namespace DirectX;
 
@@ -45,7 +45,7 @@ private:
     HRESULT RegisterWindowClass(HINSTANCE hInstance);
 
     // Create window
-    HRESULT CreateAppWindow(HINSTANCE hInstance, int nCmdShow);
+    HRESULT CreateAppWindow(HINSTANCE hInstance);
 
     // Initialize DirectX
     HRESULT InitializeDirectX();
@@ -63,8 +63,12 @@ private:
     void CreateViewport();
 
     // Compile shader
-    HRESULT CompileShader(const std::string& shaderFile, const std::string& entryPoint,
+    HRESULT CompileShader(const std::wstring& shaderFile, const std::string& entryPoint,
         const std::string& shaderModel, ID3DBlob** blobOut);
+
+    // Load a precompiled shader blob and fall back to source compilation if needed
+    HRESULT LoadShaderBlob(const wchar_t* compiledShaderName, const wchar_t* sourceRelativePath,
+        const char* entryPoint, const char* shaderModel, ID3DBlob** blobOut);
 
     // Create shaders
     HRESULT CreateShaders();
@@ -80,6 +84,10 @@ private:
 
     // Resize swap chain
     void ResizeSwapChain(UINT width, UINT height);
+
+    // RenderDoc markers
+    void BeginEvent(const wchar_t* name) const;
+    void EndEvent() const;
 
     // Window procedure
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
@@ -101,6 +109,7 @@ private:
     ID3D11DepthStencilView* m_depthStencilView;
     ID3D11RasterizerState* m_rasterizerState;
     ID3D11DepthStencilState* m_depthStencilState;
+    ID3DUserDefinedAnnotation* m_annotation;
 
     // Shaders
     ID3D11VertexShader* m_vertexShader;
