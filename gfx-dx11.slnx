@@ -4,5 +4,4 @@
     <Platform Name="x86" />
   </Configurations>
   <Project Path="cube-renderer/cube-renderer.vcxproj" Id="897677c6-5db2-4652-a6c9-c62dda73c359" />
-  <Project Path="hdr-scene/hdr-scene.vcxproj" Id="a943cf2a-6a07-4adc-801d-efbc5f438323" />
 </Solution>
