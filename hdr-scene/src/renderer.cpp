@@ -24,7 +24,7 @@ namespace
     };
 
     constexpr std::array<float, 3> kLightIntensityLevels = { 1.0f, 10.0f, 100.0f };
-    constexpr float kAmbientStrength = 0.03f;
+    constexpr float kAmbientStrength = 0.08f;
     constexpr float kMiddleGray = 0.18f;
     constexpr float kWhitePoint = 11.2f;
     constexpr float kAdaptationRate = 1.75f;
@@ -917,7 +917,8 @@ void Renderer::CreateSceneObjects()
     m_sceneObjects.clear();
 
     SceneObject floor = {};
-    floor.meshKind = MeshKind::Plane;
+    // Use a thick box instead of an infinitely thin plane so the scene remains closed from below.
+    floor.meshKind = MeshKind::Cube;
     floor.world = CreateWorldMatrix(XMFLOAT3(14.0f, 1.0f, 14.0f), XMFLOAT3(0.0f, -0.5f, 0.0f));
     floor.albedo = XMFLOAT3(0.55f, 0.57f, 0.63f);
     m_sceneObjects.push_back(floor);
@@ -930,7 +931,7 @@ void Renderer::CreateSceneObjects()
 
     SceneObject leftBox = {};
     leftBox.meshKind = MeshKind::Cube;
-    leftBox.world = CreateWorldMatrix(XMFLOAT3(1.0f, 2.1f, 1.0f), XMFLOAT3(-2.0f, 0.55f, -1.3f), -0.25f);
+    leftBox.world = CreateWorldMatrix(XMFLOAT3(1.0f, 2.1f, 1.0f), XMFLOAT3(-3.1f, 0.55f, -2.2f), -0.25f);
     leftBox.albedo = XMFLOAT3(0.72f, 0.78f, 0.95f);
     m_sceneObjects.push_back(leftBox);
 
@@ -949,9 +950,9 @@ void Renderer::CreateSceneObjects()
 
 void Renderer::InitializeLights()
 {
-    m_pointLights[0] = { XMFLOAT3(-2.5f, 1.4f, -0.9f), 5.5f, XMFLOAT3(1.0f, 0.35f, 0.30f), 1.0f };
-    m_pointLights[1] = { XMFLOAT3(0.0f, 1.9f, 1.6f), 5.5f, XMFLOAT3(0.30f, 1.0f, 0.40f), 1.0f };
-    m_pointLights[2] = { XMFLOAT3(2.5f, 1.4f, -0.6f), 5.5f, XMFLOAT3(0.35f, 0.55f, 1.0f), 1.0f };
+    m_pointLights[0] = { XMFLOAT3(-2.2f, 1.8f, -0.7f), 6.25f, XMFLOAT3(1.0f, 0.35f, 0.30f), 1.0f };
+    m_pointLights[1] = { XMFLOAT3(0.0f, 2.2f, 1.2f), 6.0f, XMFLOAT3(0.30f, 1.0f, 0.40f), 1.0f };
+    m_pointLights[2] = { XMFLOAT3(2.2f, 1.8f, -0.5f), 6.25f, XMFLOAT3(0.35f, 0.55f, 1.0f), 1.0f };
 }
 
 void Renderer::UpdateWindowTitle()
@@ -1107,6 +1108,7 @@ void Renderer::DrawSceneObject(const SceneObject& object)
     const MeshGeometry& geometry = (object.meshKind == MeshKind::Cube) ? m_cubeGeometry : m_planeGeometry;
 
     const XMMATRIX worldMatrix = XMLoadFloat4x4(&object.world);
+    // This project uses row-vector matrix math, so normals are transformed by the inverse matrix.
     const XMMATRIX normalMatrix = XMMatrixInverse(nullptr, worldMatrix);
 
     SceneObjectConstants objectConstants = {};

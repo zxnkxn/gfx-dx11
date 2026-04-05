@@ -15,7 +15,7 @@ SamplerState pointClampSampler : register(s0);
 
 float SampleValue(float2 uv)
 {
-    return sourceLuminance.SampleLevel(pointClampSampler, uv, 0.0f);
+    return max(sourceLuminance.SampleLevel(pointClampSampler, uv, 0.0f), 0.0f);
 }
 
 float PS(PSInput input) : SV_Target

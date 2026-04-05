@@ -18,8 +18,11 @@ SamplerState pointClampSampler : register(s0);
 
 float PS(PSInput input) : SV_Target
 {
+    const float currentLogAverageValue =
+        max(currentLogAverage.SampleLevel(pointClampSampler, float2(0.5f, 0.5f), 0.0f), 0.0f);
+
     const float currentAverageLuminance =
-        exp(currentLogAverage.SampleLevel(pointClampSampler, float2(0.5f, 0.5f), 0.0f));
+        max(exp(currentLogAverageValue) - 1.0f, minLuminance);
 
     const float previousAverageLuminance =
         max(previousAdapted.SampleLevel(pointClampSampler, float2(0.5f, 0.5f), 0.0f), minLuminance);

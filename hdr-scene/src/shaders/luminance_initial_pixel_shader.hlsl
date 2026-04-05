@@ -15,9 +15,11 @@ SamplerState pointClampSampler : register(s0);
 
 float SampleLogLuminance(float2 uv)
 {
-    const float3 color = hdrTexture.SampleLevel(pointClampSampler, uv, 0.0f).rgb;
+    // Clamp the sampled HDR color before luminance evaluation and store log(1 + L).
+    // This keeps the reduction chain non-negative even for very dark pixels.
+    const float3 color = max(hdrTexture.SampleLevel(pointClampSampler, uv, 0.0f).rgb, 0.0f.xxx);
     const float luminance = dot(color, float3(0.2126f, 0.7152f, 0.0722f));
-    return log(max(luminance, 1.0e-4f));
+    return log(1.0f + luminance);
 }
 
 float PS(PSInput input) : SV_Target
