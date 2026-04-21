@@ -91,6 +91,7 @@ float4 PS(PSInput input) : SV_Target
 {
     const float3 N = normalize(input.normal);
     const float3 V = normalize(cameraPosition.xyz - input.worldPosition);
+    const int displayMode = (int)globalParameters.x;
 
     const float clampedRoughness = clamp(input.roughness, 0.045f, 1.0f);
     const float clampedMetalness = clamp(input.metalness, 0.0f, 1.0f);
@@ -107,11 +108,55 @@ float4 PS(PSInput input) : SV_Target
         return float4(gammaCorrectedEmissive, 1.0f);
     }
 
+    if (displayMode != 0)
+    {
+        // Use a stable analytic preview for the BRDF terms so the debug modes
+        // stay readable and are not tied to the scene lighting composition.
+        const float3 debugNormal = (dot(N, V) >= 0.0f) ? N : -N;
+        const float3 debugViewDirection = normalize(V);
+        const float3 referenceUp = (abs(debugViewDirection.y) < 0.95f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
+        const float3 debugTangent = normalize(cross(referenceUp, debugViewDirection));
+        const float3 debugBitangent = normalize(cross(debugViewDirection, debugTangent));
+
+        const float debugNdotV = clamp(dot(debugNormal, debugViewDirection), 0.0f, 1.0f);
+
+        const float3 debugNdfLightDirection =
+            normalize(debugViewDirection * 0.80f - debugTangent * 0.52f + debugBitangent * 0.30f);
+        const float3 debugNdfHalfVector = normalize(debugViewDirection + debugNdfLightDirection);
+        const float debugNdfNdotH = clamp(dot(debugNormal, debugNdfHalfVector), 0.0f, 1.0f);
+        const float debugDistribution = DistributionGGX(debugNdfNdotH, clampedRoughness);
+
+        const float3 debugGeometryLightDirection =
+            normalize(debugViewDirection * 0.32f - debugTangent * 0.88f + debugBitangent * 0.18f);
+        const float debugGeometryNdotL = clamp(dot(debugNormal, debugGeometryLightDirection), 0.0f, 1.0f);
+        const float debugGeometry = GeometrySmith(debugNdotV, debugGeometryNdotL, clampedRoughness);
+
+        const float3 debugF0 = lerp(float3(0.03f, 0.14f, 0.72f), albedoColor, clampedMetalness);
+        const float3 debugFresnel = FresnelSchlick(debugNdotV, debugF0);
+
+        if (displayMode == 1)
+        {
+            const float distributionValue =
+                pow(clamp(log2(1.0f + debugDistribution * 96.0f) / 7.0f, 0.0f, 1.0f), 0.42f);
+            const float3 debugColor = pow(lerp(0.08f.xxx, 1.0f.xxx, distributionValue), 1.0f / 2.2f);
+            return float4(debugColor, 1.0f);
+        }
+
+        if (displayMode == 2)
+        {
+            const float geometryValue = pow(clamp(debugGeometry, 0.0f, 1.0f), 0.55f);
+            const float3 debugColor = pow(lerp(0.08f.xxx, 1.0f.xxx, geometryValue), 1.0f / 2.2f);
+            return float4(debugColor, 1.0f);
+        }
+
+        const float3 debugColor = pow(clamp(debugFresnel, 0.0f.xxx, 1.0f.xxx), 1.0f / 2.2f);
+        return float4(debugColor, 1.0f);
+    }
+
     float3 radianceSum = 0.0f.xxx;
     float accumulatedDistribution = 0.0f;
     float accumulatedGeometry = 0.0f;
     float3 accumulatedFresnel = 0.0f.xxx;
-    const float viewGeometry = GeometrySchlickGGX(clamp(dot(N, V), 0.0f, 1.0f), clampedRoughness);
 
     [unroll]
     for (int lightIndex = 0; lightIndex < 3; ++lightIndex)
@@ -123,17 +168,22 @@ float4 PS(PSInput input) : SV_Target
 
         const float NdotL = clamp(dot(N, L), 0.0f, 1.0f);
         const float NdotV = clamp(dot(N, V), 0.0f, 1.0f);
+
+        // Point lights must not affect the surface from the opposite side.
+        if (NdotL <= 0.0f || NdotV <= 0.0f)
+        {
+            continue;
+        }
+
         const float NdotH = clamp(dot(N, H), 0.0f, 1.0f);
         const float HdotV = clamp(dot(H, V), 0.0f, 1.0f);
 
         const float D = DistributionGGX(NdotH, clampedRoughness);
-        const float lightGeometry = GeometrySchlickGGX(NdotL, clampedRoughness);
-        const float G = viewGeometry * lightGeometry;
+        const float G = GeometrySmith(NdotV, NdotL, clampedRoughness);
         const float3 F = FresnelSchlick(HdotV, F0);
 
         accumulatedDistribution = max(accumulatedDistribution, D);
-        // Use a debug-friendly visibility measure instead of the raw product only.
-        accumulatedGeometry = max(accumulatedGeometry, 0.5f * (viewGeometry + lightGeometry));
+        accumulatedGeometry = max(accumulatedGeometry, G);
         accumulatedFresnel = max(accumulatedFresnel, F);
 
         const float3 numerator = D * G * F;
@@ -164,27 +214,6 @@ float4 PS(PSInput input) : SV_Target
         (kDambient * environmentDiffuse * albedoColor / kPi + environmentSpecular * kSambient) *
         max(globalParameters.y, 0.0f);
     const float3 ambientBase = albedoColor * (1.0f - clampedMetalness) * 0.02f;
-
-    const int displayMode = (int)globalParameters.x;
-    if (displayMode == 1)
-    {
-        const float distributionValue =
-            pow(clamp(log2(1.0f + accumulatedDistribution * 8.0f) / 3.6f, 0.0f, 1.0f), 0.6f);
-        return float4(distributionValue.xxx, 1.0f);
-    }
-
-    if (displayMode == 2)
-    {
-        const float geometryValue = lerp(0.15f, 1.0f, pow(clamp(accumulatedGeometry, 0.0f, 1.0f), 0.8f));
-        return float4(geometryValue.xxx, 1.0f);
-    }
-
-    if (displayMode == 3)
-    {
-        const float fresnelValue =
-            pow(dot(clamp(accumulatedFresnel, 0.0f.xxx, 1.0f.xxx), float3(0.2126f, 0.7152f, 0.0722f)), 0.45f);
-        return float4(fresnelValue.xxx, 1.0f);
-    }
 
     const float exposure = 1.2f;
     const float3 finalColor = ambientBase + ambient + radianceSum;

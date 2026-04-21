@@ -986,7 +986,7 @@ void Renderer::UpdateWindowTitle()
 
     const std::wstring title =
         m_title +
-        L" | 1 PBR | 2 NDF | 3 Geometry | 4 Fresnel | Roughness: left->right | Metalness: front->back | LMB orbit | Wheel zoom | Mode " +
+        L" | 1 PBR | 2 NDF | 3 Geometry | 4 Fresnel | Debug modes use analytic preview | Roughness: left->right | Metalness: front->back | LMB orbit | Wheel zoom | Mode " +
         std::wstring(modeName);
 
     SetWindowTextW(m_hwnd, title.c_str());
@@ -1111,8 +1111,14 @@ void Renderer::RenderSpheres()
         DrawSphereInstance(instance);
     }
 
-    for (const PointLight& light : m_pointLights)
+    for (size_t lightIndex = 0; lightIndex < m_pointLights.size(); ++lightIndex)
     {
+        if (m_displayMode != DisplayMode::Pbr)
+        {
+            continue;
+        }
+
+        const PointLight& light = m_pointLights[lightIndex];
         SphereInstance marker = {};
         marker.world = CreateWorldMatrix(
             XMFLOAT3(0.34f, 0.34f, 0.34f),
