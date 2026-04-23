@@ -131,8 +131,12 @@ float4 PS(PSInput input) : SV_Target
         const float debugGeometryNdotL = clamp(dot(debugNormal, debugGeometryLightDirection), 0.0f, 1.0f);
         const float debugGeometry = GeometrySmith(debugNdotV, debugGeometryNdotL, clampedRoughness);
 
+        const float3 debugFresnelLightDirection =
+            normalize(-debugViewDirection * 0.45f - debugTangent * 0.82f + debugBitangent * 0.35f);
+        const float3 debugFresnelHalfVector = normalize(debugViewDirection + debugFresnelLightDirection);
+        const float debugFresnelHdotV = clamp(dot(debugFresnelHalfVector, debugViewDirection), 0.0f, 1.0f);
         const float3 debugF0 = lerp(float3(0.03f, 0.14f, 0.72f), albedoColor, clampedMetalness);
-        const float3 debugFresnel = FresnelSchlick(debugNdotV, debugF0);
+        const float3 debugFresnel = FresnelSchlick(debugFresnelHdotV, debugF0);
 
         if (displayMode == 1)
         {
