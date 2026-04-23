@@ -99,6 +99,7 @@ private:
         DirectX::XMFLOAT4 faceForward;
         DirectX::XMFLOAT4 faceRight;
         DirectX::XMFLOAT4 faceUp;
+        DirectX::XMFLOAT4 prefilterParameters;
     };
 
 private:
@@ -126,10 +127,27 @@ private:
     HRESULT RenderCubemapFaces(
         ID3D11Texture2D* targetTexture,
         UINT faceSize,
+        UINT mipLevel,
+        float roughness,
+        float sourceCubemapFaceSize,
         ID3D11PixelShader* pixelShader,
         ID3D11ShaderResourceView* sourceShaderResourceView,
         const wchar_t* eventName);
     HRESULT CreateIrradianceMap();
+    HRESULT CreatePrefilteredEnvironmentMap();
+    HRESULT CreateBrdfIntegrationMap();
+    HRESULT CreateFloatTexture2D(
+        UINT width,
+        UINT height,
+        Microsoft::WRL::ComPtr<ID3D11Texture2D>& texture,
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>& shaderResourceView,
+        const char* debugNamePrefix);
+    HRESULT RenderFullscreenTexture(
+        ID3D11Texture2D* targetTexture,
+        UINT width,
+        UINT height,
+        ID3D11PixelShader* pixelShader,
+        const wchar_t* eventName);
     void CreateSceneObjects();
     void InitializeLights();
     void UpdateWindowTitle();
@@ -214,8 +232,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D11VertexShader> m_skyVertexShader;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_skyPixelShader;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> m_captureVertexShader;
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> m_fullscreenVertexShader;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_equirectangularToCubemapPixelShader;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_irradianceConvolutionPixelShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_prefilterEnvironmentPixelShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_brdfIntegrationPixelShader;
     Microsoft::WRL::ComPtr<ID3D11InputLayout> m_sceneInputLayout;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> m_linearClampSampler;
 
@@ -232,6 +253,10 @@ private:
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_environmentCubemapShaderResourceView;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_irradianceCubemap;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_irradianceCubemapShaderResourceView;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_prefilteredEnvironmentCubemap;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_prefilteredEnvironmentCubemapShaderResourceView;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_brdfIntegrationTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_brdfIntegrationShaderResourceView;
 
     // Debug layer state
     bool m_debugLayerEnabled;

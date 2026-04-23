@@ -35,6 +35,8 @@ struct PSInput
 };
 
 TextureCube<float4> irradianceMap : register(t0);
+TextureCube<float4> prefilteredEnvironmentMap : register(t1);
+Texture2D<float4> brdfIntegrationMap : register(t2);
 SamplerState linearClampSampler : register(s0);
 
 float DistributionGGX(float NdotH, float roughness)
@@ -225,7 +227,19 @@ float4 PS(PSInput input) : SV_Target
 
     const float3 irradiance = irradianceMap.SampleLevel(linearClampSampler, N, 0.0f).rgb;
     const float3 ambientDiffuse = irradiance * albedoColor;
-    const float3 ambient = kDambient * ambientDiffuse * max(globalParameters.y, 0.0f);
+    const float3 reflectionVector = normalize(reflect(-V, N));
+    const float maxReflectionLod = max(globalParameters.z, 0.0f);
+    const float3 prefilteredColor =
+        prefilteredEnvironmentMap.SampleLevel(
+            linearClampSampler,
+            reflectionVector,
+            clampedRoughness * maxReflectionLod).rgb;
+    const float2 brdf = brdfIntegrationMap.SampleLevel(
+        linearClampSampler,
+        float2(NdotV, clampedRoughness),
+        0.0f).rg;
+    const float3 ambientSpecular = prefilteredColor * (Fambient * brdf.x + brdf.y);
+    const float3 ambient = (kDambient * ambientDiffuse + ambientSpecular) * max(globalParameters.y, 0.0f);
 
     const float exposure = 1.2f;
     const float3 finalColor = (displayMode == 4) ? radianceSum : (ambient + radianceSum);
