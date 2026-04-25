@@ -1,29 +1,48 @@
-# DirectX 11 IBL Diffuse + Specular Application
+# DirectX 11 glTF Metallic-Roughness Viewer
 
-DirectX 11 application rendering a PBR sphere grid with HDRI-based environment lighting.
+DirectX 11 application that loads a glTF 2.0 model and renders it with HDRI-based image-based lighting and a metallic-roughness PBR shader.
 
 ## Features
 
-- Loads a Radiance HDRI file (`*.hdr`) from `assets/hdri`
-- Converts the equirectangular HDRI texture into a cubemap texture on the GPU
-- Displays the converted cubemap on the environment sphere
-- Builds an irradiance cubemap from the environment cubemap
-- Builds a prefiltered specular cubemap with roughness encoded in mip levels
-- Builds a BRDF integration LUT for split-sum environment specular
-- Uses the irradiance map in the PBR shader for ambient diffuse lighting
-- Uses the prefiltered cubemap and BRDF LUT in the PBR shader for ambient specular reflections
-- Keeps three point lights for direct lighting and allows toggling them with the `L` key
-- Preserves the PBR debug modes for NDF, Geometry, and Fresnel with digit keys `1..4`
+- Loads the first `*.gltf` or `*.glb` file found in `assets/models`
+- Supports glTF 2.0 scenes with mesh nodes, transforms, indices, and triangle primitives
+- Uses only the metallic-roughness material workflow
+- Reads `baseColorFactor`, `metallicFactor`, `roughnessFactor`, `emissiveFactor`, and `doubleSided`
+- Loads embedded or external glTF textures for base color, metallic-roughness, emissive, and occlusion inputs
+- Builds the environment cubemap, irradiance map, prefiltered specular map, and BRDF LUT from the HDRI
+- Keeps the BRDF debug modes from the previous PBR demo
+- Includes a sample metallic torus model in `assets/models/metallic_torus.gltf`
 
-## HDRI File
+## Supported glTF Subset
 
-Place exactly one HDR file into:
+- Formats: `*.gltf`, `*.glb`
+- Primitive mode: triangles only
+- Vertex attributes: `POSITION`, `NORMAL`, `TEXCOORD_0`
+- Buffers: external files or base64 data URIs
+- Materials: core metallic-roughness only
 
-- `ibl-diffuse/assets/hdri`
+Not supported:
 
-Recommended file requirements:
+- `KHR_materials_pbrSpecularGlossiness`
+- skinning, animation, morph targets, sparse accessors
 
-- Format: Radiance HDR (`*.hdr`)
-- Projection: equirectangular / lat-long
-- Aspect ratio: `2:1`
-- Recommended resolution: `2048x1024` or `4096x2048`
+## Assets
+
+Place assets here:
+
+- HDRI: `ibl-diffuse/assets/hdri`
+- glTF model: `ibl-diffuse/assets/models`
+
+The project will automatically pick the first matching file from each folder.
+
+## Controls
+
+- `LMB` drag: orbit camera
+- Mouse wheel: zoom
+- `R`: reset camera
+- `L`: toggle point lights
+- `1`: full PBR
+- `2`: normal distribution debug
+- `3`: geometry term debug
+- `4`: fresnel debug
+- `5`: direct lighting only

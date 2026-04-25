@@ -15,6 +15,9 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="src\gltf_loader.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\hdri_loader.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -26,6 +29,9 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\gltf_loader.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\hdri_loader.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -67,5 +73,6 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="assets\hdri\PLACE_HDRI_HERE.txt" />
+    <None Include="assets\hdri\*.hdr" />
   </ItemGroup>
 </Project>

@@ -2,6 +2,7 @@
 #include "hdri_loader.h"
 
 #include <d3d11sdklayers.h>
+#include <wincodec.h>
 #include <windowsx.h>
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <cwchar>
 #include <filesystem>
+#include <sstream>
 #include <string_view>
 #include <system_error>
 
@@ -20,11 +22,7 @@ namespace
 {
     namespace fs = std::filesystem;
 
-    struct SceneVertex
-    {
-        XMFLOAT3 position;
-        XMFLOAT3 normal;
-    };
+    using SceneVertex = Gltf::Vertex;
 
     constexpr float kPi = 3.1415926535f;
     constexpr UINT kSphereLatitudeSegments = 32;
@@ -37,13 +35,11 @@ namespace
     constexpr UINT kPrefilteredEnvironmentCubemapSize = 128;
     constexpr UINT kPrefilteredEnvironmentCubemapMipLevels = 5;
     constexpr UINT kBrdfIntegrationMapSize = 512;
-    constexpr UINT kSphereGridWidth = 6;
-    constexpr UINT kSphereGridHeight = 6;
-    constexpr float kSphereGridSpacing = 2.35f;
-    constexpr float kSphereScale = 0.78f;
     constexpr float kEnvironmentSphereScale = 80.0f;
     constexpr float kEnvironmentIntensity = 0.08f;
+    constexpr float kTargetSceneRadius = 2.5f;
     constexpr float kMaxReflectionLod = static_cast<float>(kPrefilteredEnvironmentCubemapMipLevels - 1u);
+    constexpr float kLightMarkerScale = 0.18f;
 
     struct CubemapCaptureFace
     {
@@ -140,6 +136,35 @@ namespace
         }
     }
 
+    void AppendSceneFilesFromDirectory(const fs::path& directory, std::vector<fs::path>& files)
+    {
+        std::error_code errorCode;
+        if (!fs::is_directory(directory, errorCode))
+        {
+            return;
+        }
+
+        for (const fs::directory_entry& entry : fs::directory_iterator(directory, errorCode))
+        {
+            if (errorCode)
+            {
+                break;
+            }
+
+            if (!entry.is_regular_file(errorCode))
+            {
+                continue;
+            }
+
+            const fs::path filePath = entry.path();
+            if (_wcsicmp(filePath.extension().c_str(), L".gltf") == 0 ||
+                _wcsicmp(filePath.extension().c_str(), L".glb") == 0)
+            {
+                files.push_back(filePath);
+            }
+        }
+    }
+
     XMFLOAT4X4 StoreMatrix(const XMMATRIX& matrix)
     {
         XMFLOAT4X4 value = {};
@@ -192,6 +217,44 @@ namespace
         XMStoreFloat3(&normalized, vector);
         return normalized;
     }
+
+    std::wstring HResultToHex(HRESULT hr)
+    {
+        std::wstringstream stream;
+        stream << L"0x" << std::hex << std::uppercase << static_cast<std::uint32_t>(hr);
+        return stream.str();
+    }
+
+    void NormalizeSceneForViewing(Gltf::Scene& scene)
+    {
+        const XMVECTOR boundsMin = XMLoadFloat3(&scene.boundsMin);
+        const XMVECTOR boundsMax = XMLoadFloat3(&scene.boundsMax);
+        const XMVECTOR center = XMVectorScale(XMVectorAdd(boundsMin, boundsMax), 0.5f);
+        const XMVECTOR extents = XMVectorScale(XMVectorSubtract(boundsMax, boundsMin), 0.5f);
+        const float radius = XMVectorGetX(XMVector3Length(extents));
+        if (radius <= 1.0e-4f)
+        {
+            return;
+        }
+
+        const float uniformScale = kTargetSceneRadius / radius;
+        XMFLOAT3 centerPoint = {};
+        XMStoreFloat3(&centerPoint, center);
+
+        const XMMATRIX normalizationMatrix =
+            XMMatrixTranslation(-centerPoint.x, -centerPoint.y, -centerPoint.z) *
+            XMMatrixScaling(uniformScale, uniformScale, uniformScale);
+
+        for (Gltf::NodePrimitive& nodePrimitive : scene.nodePrimitives)
+        {
+            const XMMATRIX worldMatrix = XMLoadFloat4x4(&nodePrimitive.world);
+            nodePrimitive.world = StoreMatrix(worldMatrix * normalizationMatrix);
+        }
+
+        const XMVECTOR scaledExtents = XMVectorScale(extents, uniformScale);
+        XMStoreFloat3(&scene.boundsMin, XMVectorNegate(scaledExtents));
+        XMStoreFloat3(&scene.boundsMax, scaledExtents);
+    }
 }
 
 Renderer::Renderer() :
@@ -200,7 +263,9 @@ Renderer::Renderer() :
     m_width(1400),
     m_height(900),
     m_isMinimized(false),
-    m_title(L"IBL Diffuse + Specular"),
+    m_title(L"glTF Metallic-Roughness Viewer"),
+    m_initializationErrorMessage(),
+    m_comInitialized(false),
     m_isOrbiting(false),
     m_lastMousePosition{},
     m_cameraTarget(0.0f, 0.0f, 0.0f),
@@ -211,6 +276,9 @@ Renderer::Renderer() :
     m_displayMode(DisplayMode::Pbr),
     m_pointLightsEnabled(true),
     m_loadedHdriFileName(L"No HDRI"),
+    m_loadedSceneFileName(L"No glTF"),
+    m_sceneBoundsMin(-1.0f, -1.0f, -1.0f),
+    m_sceneBoundsMax(1.0f, 1.0f, 1.0f),
     m_debugLayerEnabled(false)
 {
     XMStoreFloat4x4(&m_viewMatrix, XMMatrixIdentity());
@@ -223,19 +291,38 @@ Renderer::~Renderer()
     Cleanup();
 }
 
+const std::wstring& Renderer::GetInitializationErrorMessage() const
+{
+    return m_initializationErrorMessage;
+}
+
 HRESULT Renderer::Initialize(HINSTANCE hInstance, int nCmdShow)
 {
     m_hInstance = hInstance;
+    m_initializationErrorMessage.clear();
+
+    const HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (SUCCEEDED(comHr))
+    {
+        m_comInitialized = true;
+    }
+    else if (comHr != RPC_E_CHANGED_MODE)
+    {
+        SetInitializationError(L"Failed to initialize COM.\nHRESULT: " + HResultToHex(comHr));
+        return comHr;
+    }
 
     HRESULT hr = RegisterWindowClass(hInstance);
     if (FAILED(hr))
     {
+        SetInitializationError(L"Failed to register the window class.\nHRESULT: " + HResultToHex(hr));
         return hr;
     }
 
     hr = CreateAppWindow(hInstance, nCmdShow);
     if (FAILED(hr))
     {
+        SetInitializationError(L"Failed to create the application window.\nHRESULT: " + HResultToHex(hr));
         return hr;
     }
 
@@ -245,7 +332,12 @@ HRESULT Renderer::Initialize(HINSTANCE hInstance, int nCmdShow)
         return hr;
     }
 
-    CreateSceneObjects();
+    hr = LoadSceneModel();
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
     InitializeLights();
     ResetCamera();
     UpdateWindowTitle();
@@ -266,7 +358,7 @@ HRESULT Renderer::RegisterWindowClass(HINSTANCE hInstance)
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     windowClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     windowClass.hbrBackground = nullptr;
-    windowClass.lpszClassName = L"PBRSphereWindowClass";
+    windowClass.lpszClassName = L"GltfViewerWindowClass";
 
     if (!RegisterClassExW(&windowClass))
     {
@@ -294,7 +386,7 @@ HRESULT Renderer::CreateAppWindow(HINSTANCE hInstance, int nCmdShow)
 
     m_hwnd = CreateWindowExW(
         0,
-        L"PBRSphereWindowClass",
+        L"GltfViewerWindowClass",
         m_title.c_str(),
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
@@ -319,52 +411,94 @@ HRESULT Renderer::InitializeDirectX()
     HRESULT hr = CreateDeviceAndContext();
     if (FAILED(hr))
     {
+        if (m_initializationErrorMessage.empty())
+        {
+            SetInitializationError(L"Failed to create the Direct3D device/context.\nHRESULT: " + HResultToHex(hr));
+        }
         return hr;
     }
 
     hr = CreateSwapChain();
     if (FAILED(hr))
     {
+        if (m_initializationErrorMessage.empty())
+        {
+            SetInitializationError(L"Failed to create the swap chain.\nHRESULT: " + HResultToHex(hr));
+        }
         return hr;
     }
 
     hr = CreateWindowSizeResources();
     if (FAILED(hr))
     {
+        if (m_initializationErrorMessage.empty())
+        {
+            SetInitializationError(L"Failed to create the window-size dependent render targets.\nHRESULT: " + HResultToHex(hr));
+        }
         return hr;
     }
 
     hr = CreatePipelineStates();
     if (FAILED(hr))
     {
+        if (m_initializationErrorMessage.empty())
+        {
+            SetInitializationError(L"Failed to create Direct3D pipeline states.\nHRESULT: " + HResultToHex(hr));
+        }
         return hr;
     }
 
     hr = CreateSamplers();
     if (FAILED(hr))
     {
+        if (m_initializationErrorMessage.empty())
+        {
+            SetInitializationError(L"Failed to create sampler states.\nHRESULT: " + HResultToHex(hr));
+        }
         return hr;
     }
 
     hr = CreateConstantBuffers();
     if (FAILED(hr))
     {
+        if (m_initializationErrorMessage.empty())
+        {
+            SetInitializationError(L"Failed to create constant buffers.\nHRESULT: " + HResultToHex(hr));
+        }
         return hr;
     }
 
     hr = CreateShaders();
     if (FAILED(hr))
     {
+        if (m_initializationErrorMessage.empty())
+        {
+            SetInitializationError(L"Failed to create shaders or input layout.\nHRESULT: " + HResultToHex(hr));
+        }
         return hr;
     }
 
     hr = CreateGeometry();
     if (FAILED(hr))
     {
+        if (m_initializationErrorMessage.empty())
+        {
+            SetInitializationError(L"Failed to create mesh geometry.\nHRESULT: " + HResultToHex(hr));
+        }
         return hr;
     }
 
-    return CreateEnvironmentCubemap();
+    hr = CreateEnvironmentCubemap();
+    if (FAILED(hr))
+    {
+        if (m_initializationErrorMessage.empty())
+        {
+            SetInitializationError(L"Failed to initialize the environment maps.\nHRESULT: " + HResultToHex(hr));
+        }
+        return hr;
+    }
+
+    return S_OK;
 }
 
 HRESULT Renderer::CreateDeviceAndContext()
@@ -593,6 +727,15 @@ HRESULT Renderer::CreatePipelineStates()
         return hr;
     }
 
+    D3D11_RASTERIZER_DESC doubleSidedRasterizerDesc = rasterizerDesc;
+    doubleSidedRasterizerDesc.CullMode = D3D11_CULL_NONE;
+
+    hr = m_device->CreateRasterizerState(&doubleSidedRasterizerDesc, m_doubleSidedRasterizerState.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
     D3D11_RASTERIZER_DESC skyRasterizerDesc = rasterizerDesc;
     // The camera lives inside the environment sphere, so we must draw only one
     // shell to avoid blending the opposite hemisphere over the visible one.
@@ -615,6 +758,15 @@ HRESULT Renderer::CreatePipelineStates()
         return hr;
     }
 
+    D3D11_DEPTH_STENCIL_DESC transparentDepthStencilDesc = depthStencilDesc;
+    transparentDepthStencilDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+
+    hr = m_device->CreateDepthStencilState(&transparentDepthStencilDesc, m_transparentDepthStencilState.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
     D3D11_DEPTH_STENCIL_DESC skyDepthStencilDesc = {};
     skyDepthStencilDesc.DepthEnable = FALSE;
     skyDepthStencilDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
@@ -625,10 +777,29 @@ HRESULT Renderer::CreatePipelineStates()
         return hr;
     }
 
+    D3D11_BLEND_DESC alphaBlendDesc = {};
+    alphaBlendDesc.RenderTarget[0].BlendEnable = TRUE;
+    alphaBlendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    alphaBlendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    alphaBlendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    alphaBlendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    alphaBlendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    alphaBlendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    alphaBlendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+
+    hr = m_device->CreateBlendState(&alphaBlendDesc, m_alphaBlendState.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
     SetDebugName(m_rasterizerState.Get(), "PBRSphereRasterizerState");
+    SetDebugName(m_doubleSidedRasterizerState.Get(), "GLTFDoubleSidedRasterizerState");
     SetDebugName(m_skyRasterizerState.Get(), "PBRSphereSkyRasterizerState");
     SetDebugName(m_depthStencilState.Get(), "PBRSphereDepthStencilState");
+    SetDebugName(m_transparentDepthStencilState.Get(), "GLTFTransparentDepthStencilState");
     SetDebugName(m_skyDepthStencilState.Get(), "PBRSphereSkyDepthStencilState");
+    SetDebugName(m_alphaBlendState.Get(), "GLTFAlphaBlendState");
     return S_OK;
 }
 
@@ -648,6 +819,19 @@ HRESULT Renderer::CreateSamplers()
     }
 
     SetDebugName(m_linearClampSampler.Get(), "PBRSphereLinearClampSampler");
+
+    D3D11_SAMPLER_DESC wrapSamplerDesc = samplerDesc;
+    wrapSamplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+    wrapSamplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+    wrapSamplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+
+    const HRESULT wrapHr = m_device->CreateSamplerState(&wrapSamplerDesc, m_linearWrapSampler.ReleaseAndGetAddressOf());
+    if (FAILED(wrapHr))
+    {
+        return wrapHr;
+    }
+
+    SetDebugName(m_linearWrapSampler.Get(), "GLTFLinearWrapSampler");
     return S_OK;
 }
 
@@ -702,6 +886,7 @@ HRESULT Renderer::CreateShaders()
     {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offsetof(SceneVertex, position), D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offsetof(SceneVertex, normal), D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(SceneVertex, texCoord), D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
 
     hr = m_device->CreateInputLayout(
@@ -921,7 +1106,7 @@ HRESULT Renderer::CreateSphereMeshGeometry(UINT latitudeSegments, UINT longitude
 
             const float x = std::cos(theta) * ringRadius;
             const float z = std::sin(theta) * ringRadius;
-            vertices.push_back({ XMFLOAT3(x, y, z), XMFLOAT3(x, y, z) });
+            vertices.push_back({ XMFLOAT3(x, y, z), XMFLOAT3(x, y, z), XMFLOAT2(u, 1.0f - v) });
         }
     }
 
@@ -955,6 +1140,485 @@ HRESULT Renderer::CreateSphereMeshGeometry(UINT latitudeSegments, UINT longitude
         debugName);
 }
 
+HRESULT Renderer::LoadSceneModel()
+{
+    ReleaseModelResources();
+
+    const fs::path sceneFilePath = FindSceneFile();
+    if (sceneFilePath.empty())
+    {
+        m_loadedSceneFileName = L"Missing glTF";
+        SetInitializationError(
+            L"glTF scene file was not found.\n"
+            L"Place a .gltf or .glb file in one of the assets/models folders near the project or executable.");
+        return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    }
+
+    Gltf::Scene scene = {};
+    const HRESULT sceneLoadHr = Gltf::LoadScene(sceneFilePath, scene);
+    if (FAILED(sceneLoadHr))
+    {
+        m_loadedSceneFileName = L"Failed glTF";
+        std::wstring details = Gltf::GetLastErrorMessage();
+        if (details.empty())
+        {
+            details = L"The loader did not provide additional details.";
+        }
+
+        SetInitializationError(
+            L"Failed to load glTF scene:\n" +
+            sceneFilePath.wstring() +
+            L"\nReason: " +
+            details +
+            L"\nHRESULT: " +
+            HResultToHex(sceneLoadHr));
+        return sceneLoadHr;
+    }
+
+    NormalizeSceneForViewing(scene);
+
+    m_loadedSceneFileName = scene.sourceFileName;
+    m_sceneBoundsMin = scene.boundsMin;
+    m_sceneBoundsMax = scene.boundsMax;
+    m_initializationErrorMessage.clear();
+
+    auto failSceneInitialization = [this, &sceneFilePath](const std::wstring& step, HRESULT error, const std::wstring& details = std::wstring()) -> HRESULT
+    {
+        std::wstring message = L"Failed while preparing the glTF scene resources.";
+        message += L"\nScene: ";
+        message += sceneFilePath.wstring();
+        message += L"\nStep: ";
+        message += step;
+        if (!details.empty())
+        {
+            message += L"\nReason: ";
+            message += details;
+        }
+
+        message += L"\nHRESULT: ";
+        message += HResultToHex(error);
+        SetInitializationError(std::move(message));
+        return error;
+    };
+
+    auto describeTextureStage = [&scene](const wchar_t* textureRole, size_t materialIndex, const Gltf::TextureRef& textureRef) -> std::wstring
+    {
+        std::wstring step = L"loading ";
+        step += textureRole;
+        step += L" for material ";
+        step += std::to_wstring(materialIndex);
+
+        if (textureRef.imageIndex >= 0 && static_cast<size_t>(textureRef.imageIndex) < scene.images.size())
+        {
+            const std::wstring& debugName = scene.images[static_cast<size_t>(textureRef.imageIndex)].debugName;
+            if (!debugName.empty())
+            {
+                step += L" (";
+                step += debugName;
+                step += L")";
+            }
+        }
+
+        return step;
+    };
+
+    HRESULT hr = S_OK;
+    if (m_defaultWhiteLinearShaderResourceView == nullptr)
+    {
+        hr = CreateSolidColorTexture(
+            XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f),
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            m_defaultWhiteLinearShaderResourceView,
+            "DefaultWhiteLinear");
+        if (FAILED(hr))
+        {
+            return failSceneInitialization(L"creating the default linear material texture", hr);
+        }
+    }
+
+    if (m_defaultWhiteSrgbShaderResourceView == nullptr)
+    {
+        hr = CreateSolidColorTexture(
+            XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f),
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            m_defaultWhiteSrgbShaderResourceView,
+            "DefaultWhiteSrgb");
+        if (FAILED(hr))
+        {
+            return failSceneInitialization(L"creating the default sRGB material texture", hr);
+        }
+    }
+
+    std::vector<ComPtr<ID3D11ShaderResourceView>> linearTextureCache(scene.images.size());
+    std::vector<ComPtr<ID3D11ShaderResourceView>> srgbTextureCache(scene.images.size());
+
+    auto resolveTexture = [this, &scene, &linearTextureCache, &srgbTextureCache](
+        const Gltf::TextureRef& textureRef,
+        bool srgb,
+        const char* debugNamePrefix,
+        const ComPtr<ID3D11ShaderResourceView>& defaultTexture,
+        ComPtr<ID3D11ShaderResourceView>& destination) -> HRESULT
+    {
+        if (textureRef.imageIndex < 0)
+        {
+            destination = defaultTexture;
+            return S_OK;
+        }
+
+        if (static_cast<size_t>(textureRef.imageIndex) >= scene.images.size())
+        {
+            return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        }
+
+        std::vector<ComPtr<ID3D11ShaderResourceView>>& cache = srgb ? srgbTextureCache : linearTextureCache;
+        ComPtr<ID3D11ShaderResourceView>& cachedTexture = cache[static_cast<size_t>(textureRef.imageIndex)];
+        if (cachedTexture == nullptr)
+        {
+            const HRESULT loadHr = CreateTextureFromEncodedImage(
+                scene.images[static_cast<size_t>(textureRef.imageIndex)],
+                srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM,
+                cachedTexture,
+                debugNamePrefix);
+            if (FAILED(loadHr))
+            {
+                return loadHr;
+            }
+        }
+
+        destination = cachedTexture;
+        return S_OK;
+    };
+
+    m_modelMaterials.reserve(scene.materials.size());
+    for (size_t materialIndex = 0; materialIndex < scene.materials.size(); ++materialIndex)
+    {
+        const Gltf::Material& sourceMaterial = scene.materials[materialIndex];
+        ModelMaterial material = {};
+        material.baseColorFactor = sourceMaterial.baseColorFactor;
+        material.emissiveFactor = XMFLOAT4(
+            sourceMaterial.emissiveFactor.x,
+            sourceMaterial.emissiveFactor.y,
+            sourceMaterial.emissiveFactor.z,
+            1.0f);
+        material.roughnessFactor = sourceMaterial.roughnessFactor;
+        material.metallicFactor = sourceMaterial.metallicFactor;
+        material.occlusionStrength = sourceMaterial.occlusionStrength;
+        material.alphaCutoff = sourceMaterial.alphaCutoff;
+        material.doubleSided = sourceMaterial.doubleSided;
+        material.alphaMode = sourceMaterial.alphaMode;
+        material.baseColorTextureShaderResourceView = m_defaultWhiteSrgbShaderResourceView;
+        material.metallicRoughnessTextureShaderResourceView = m_defaultWhiteLinearShaderResourceView;
+        material.emissiveTextureShaderResourceView = m_defaultWhiteSrgbShaderResourceView;
+        material.occlusionTextureShaderResourceView = m_defaultWhiteLinearShaderResourceView;
+
+        hr = resolveTexture(
+            sourceMaterial.baseColorTexture,
+            true,
+            "GLTFBaseColorTexture",
+            m_defaultWhiteSrgbShaderResourceView,
+            material.baseColorTextureShaderResourceView);
+        if (FAILED(hr))
+        {
+            ReleaseModelResources();
+            return failSceneInitialization(
+                describeTextureStage(L"the base color texture", materialIndex, sourceMaterial.baseColorTexture),
+                hr);
+        }
+
+        hr = resolveTexture(
+            sourceMaterial.metallicRoughnessTexture,
+            false,
+            "GLTFMetallicRoughnessTexture",
+            m_defaultWhiteLinearShaderResourceView,
+            material.metallicRoughnessTextureShaderResourceView);
+        if (FAILED(hr))
+        {
+            ReleaseModelResources();
+            return failSceneInitialization(
+                describeTextureStage(L"the metallic-roughness texture", materialIndex, sourceMaterial.metallicRoughnessTexture),
+                hr);
+        }
+
+        hr = resolveTexture(
+            sourceMaterial.emissiveTexture,
+            true,
+            "GLTFEmissiveTexture",
+            m_defaultWhiteSrgbShaderResourceView,
+            material.emissiveTextureShaderResourceView);
+        if (FAILED(hr))
+        {
+            ReleaseModelResources();
+            return failSceneInitialization(
+                describeTextureStage(L"the emissive texture", materialIndex, sourceMaterial.emissiveTexture),
+                hr);
+        }
+
+        hr = resolveTexture(
+            sourceMaterial.occlusionTexture,
+            false,
+            "GLTFOcclusionTexture",
+            m_defaultWhiteLinearShaderResourceView,
+            material.occlusionTextureShaderResourceView);
+        if (FAILED(hr))
+        {
+            ReleaseModelResources();
+            return failSceneInitialization(
+                describeTextureStage(L"the occlusion texture", materialIndex, sourceMaterial.occlusionTexture),
+                hr);
+        }
+
+        m_modelMaterials.push_back(material);
+    }
+
+    m_modelPrimitives.reserve(scene.primitives.size());
+    for (size_t primitiveIndex = 0; primitiveIndex < scene.primitives.size(); ++primitiveIndex)
+    {
+        const Gltf::Primitive& sourcePrimitive = scene.primitives[primitiveIndex];
+
+        MeshGeometry geometry = {};
+        const std::string debugName = "GLTFPrimitive" + std::to_string(primitiveIndex);
+        const HRESULT geometryHr = CreateMeshGeometry(
+            sourcePrimitive.vertices.data(),
+            sizeof(SceneVertex),
+            static_cast<UINT>(sourcePrimitive.vertices.size()),
+            sourcePrimitive.indices.data(),
+            static_cast<UINT>(sourcePrimitive.indices.size()),
+            geometry,
+            debugName.c_str());
+        if (FAILED(geometryHr))
+        {
+            ReleaseModelResources();
+            return failSceneInitialization(
+                L"creating mesh buffers for primitive " + std::to_wstring(primitiveIndex),
+                geometryHr);
+        }
+
+        ModelPrimitive primitive = {};
+        primitive.geometry = std::move(geometry);
+        primitive.materialIndex =
+            (sourcePrimitive.materialIndex < m_modelMaterials.size())
+            ? sourcePrimitive.materialIndex
+            : 0u;
+        m_modelPrimitives.push_back(std::move(primitive));
+    }
+
+    m_modelDrawItems.reserve(scene.nodePrimitives.size());
+    for (const Gltf::NodePrimitive& sourceDrawItem : scene.nodePrimitives)
+    {
+        if (sourceDrawItem.primitiveIndex >= m_modelPrimitives.size())
+        {
+            ReleaseModelResources();
+            return failSceneInitialization(
+                L"validating node draw item references",
+                HRESULT_FROM_WIN32(ERROR_INVALID_DATA),
+                L"A node references a primitive index that was not loaded.");
+        }
+
+        ModelDrawItem drawItem = {};
+        drawItem.primitiveIndex = sourceDrawItem.primitiveIndex;
+        drawItem.world = sourceDrawItem.world;
+        m_modelDrawItems.push_back(drawItem);
+    }
+
+    if (m_modelDrawItems.empty())
+    {
+        return failSceneInitialization(
+            L"building the draw list",
+            HRESULT_FROM_WIN32(ERROR_INVALID_DATA),
+            L"The glTF scene did not produce any drawable primitives.");
+    }
+
+    return S_OK;
+}
+
+HRESULT Renderer::CreateSolidColorTexture(
+    const XMFLOAT4& color,
+    DXGI_FORMAT shaderResourceFormat,
+    ComPtr<ID3D11ShaderResourceView>& shaderResourceView,
+    const char* debugNamePrefix)
+{
+    const auto toByte = [](float value) -> std::uint8_t
+        {
+            return static_cast<std::uint8_t>(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
+        };
+
+    const std::uint8_t pixel[] =
+    {
+        toByte(color.x),
+        toByte(color.y),
+        toByte(color.z),
+        toByte(color.w),
+    };
+
+    D3D11_TEXTURE2D_DESC textureDesc = {};
+    textureDesc.Width = 1;
+    textureDesc.Height = 1;
+    textureDesc.MipLevels = 1;
+    textureDesc.ArraySize = 1;
+    textureDesc.Format = shaderResourceFormat;
+    textureDesc.SampleDesc.Count = 1;
+    textureDesc.Usage = D3D11_USAGE_DEFAULT;
+    textureDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    D3D11_SUBRESOURCE_DATA initialData = {};
+    initialData.pSysMem = pixel;
+    initialData.SysMemPitch = sizeof(pixel);
+
+    ComPtr<ID3D11Texture2D> texture;
+    HRESULT hr = m_device->CreateTexture2D(&textureDesc, &initialData, texture.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC shaderResourceViewDesc = {};
+    shaderResourceViewDesc.Format = shaderResourceFormat;
+    shaderResourceViewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    shaderResourceViewDesc.Texture2D.MipLevels = 1;
+
+    hr = m_device->CreateShaderResourceView(texture.Get(), &shaderResourceViewDesc, shaderResourceView.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    SetDebugName(texture.Get(), std::string(debugNamePrefix) + ".Texture");
+    SetDebugName(shaderResourceView.Get(), std::string(debugNamePrefix) + ".SRV");
+    return S_OK;
+}
+
+HRESULT Renderer::CreateTextureFromEncodedImage(
+    const Gltf::Image& image,
+    DXGI_FORMAT shaderResourceFormat,
+    ComPtr<ID3D11ShaderResourceView>& shaderResourceView,
+    const char* debugNamePrefix)
+{
+    if (image.encodedBytes.empty())
+    {
+        return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    }
+
+    ComPtr<IWICImagingFactory> imagingFactory;
+    HRESULT hr = CoCreateInstance(
+        CLSID_WICImagingFactory,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(imagingFactory.ReleaseAndGetAddressOf()));
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    ComPtr<IWICStream> stream;
+    hr = imagingFactory->CreateStream(stream.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = stream->InitializeFromMemory(
+        const_cast<BYTE*>(reinterpret_cast<const BYTE*>(image.encodedBytes.data())),
+        static_cast<DWORD>(image.encodedBytes.size()));
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    ComPtr<IWICBitmapDecoder> decoder;
+    hr = imagingFactory->CreateDecoderFromStream(
+        stream.Get(),
+        nullptr,
+        WICDecodeMetadataCacheOnDemand,
+        decoder.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    ComPtr<IWICBitmapFrameDecode> frame;
+    hr = decoder->GetFrame(0, frame.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    ComPtr<IWICFormatConverter> formatConverter;
+    hr = imagingFactory->CreateFormatConverter(formatConverter.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = formatConverter->Initialize(
+        frame.Get(),
+        GUID_WICPixelFormat32bppRGBA,
+        WICBitmapDitherTypeNone,
+        nullptr,
+        0.0,
+        WICBitmapPaletteTypeCustom);
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    UINT width = 0;
+    UINT height = 0;
+    hr = formatConverter->GetSize(&width, &height);
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    if (width == 0 || height == 0)
+    {
+        return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    }
+
+    const UINT rowPitch = width * 4u;
+    std::vector<std::uint8_t> pixels(static_cast<size_t>(rowPitch) * static_cast<size_t>(height));
+    hr = formatConverter->CopyPixels(nullptr, rowPitch, static_cast<UINT>(pixels.size()), pixels.data());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    D3D11_TEXTURE2D_DESC textureDesc = {};
+    textureDesc.Width = width;
+    textureDesc.Height = height;
+    textureDesc.MipLevels = 1;
+    textureDesc.ArraySize = 1;
+    textureDesc.Format = shaderResourceFormat;
+    textureDesc.SampleDesc.Count = 1;
+    textureDesc.Usage = D3D11_USAGE_DEFAULT;
+    textureDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    D3D11_SUBRESOURCE_DATA subresourceData = {};
+    subresourceData.pSysMem = pixels.data();
+    subresourceData.SysMemPitch = rowPitch;
+
+    ComPtr<ID3D11Texture2D> texture;
+    hr = m_device->CreateTexture2D(&textureDesc, &subresourceData, texture.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC shaderResourceViewDesc = {};
+    shaderResourceViewDesc.Format = shaderResourceFormat;
+    shaderResourceViewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    shaderResourceViewDesc.Texture2D.MipLevels = 1;
+
+    hr = m_device->CreateShaderResourceView(texture.Get(), &shaderResourceViewDesc, shaderResourceView.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    SetDebugName(texture.Get(), std::string(debugNamePrefix) + ".Texture");
+    SetDebugName(shaderResourceView.Get(), std::string(debugNamePrefix) + ".SRV");
+    return S_OK;
+}
+
 HRESULT Renderer::CreateEnvironmentCubemap()
 {
     m_hdriTexture.Reset();
@@ -972,6 +1636,9 @@ HRESULT Renderer::CreateEnvironmentCubemap()
     if (hdriFilePath.empty())
     {
         m_loadedHdriFileName = L"Missing HDRI";
+        SetInitializationError(
+            L"HDRI file was not found.\n"
+            L"Place a Radiance .hdr file in one of the assets/hdri folders near the project or executable.");
         return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
     }
 
@@ -980,12 +1647,22 @@ HRESULT Renderer::CreateEnvironmentCubemap()
     if (FAILED(hr))
     {
         m_loadedHdriFileName = L"Invalid HDRI";
+        SetInitializationError(
+            L"Failed to read HDRI file:\n" +
+            hdriFilePath.wstring() +
+            L"\nHRESULT: " +
+            HResultToHex(hr));
         return hr;
     }
 
     hr = CreateHdriTexture(hdriImage);
     if (FAILED(hr))
     {
+        SetInitializationError(
+            L"Failed to create the GPU texture from the HDRI:\n" +
+            hdriFilePath.wstring() +
+            L"\nHRESULT: " +
+            HResultToHex(hr));
         return hr;
     }
 
@@ -998,6 +1675,7 @@ HRESULT Renderer::CreateEnvironmentCubemap()
         "IBLDiffuseEnvironmentCubemap");
     if (FAILED(hr))
     {
+        SetInitializationError(L"Failed to allocate the environment cubemap.\nHRESULT: " + HResultToHex(hr));
         return hr;
     }
 
@@ -1012,6 +1690,7 @@ HRESULT Renderer::CreateEnvironmentCubemap()
         L"HdriToCubemapPass");
     if (FAILED(hr))
     {
+        SetInitializationError(L"Failed to render the environment cubemap from the HDRI.\nHRESULT: " + HResultToHex(hr));
         return hr;
     }
 
@@ -1020,22 +1699,26 @@ HRESULT Renderer::CreateEnvironmentCubemap()
     hr = CreateIrradianceMap();
     if (FAILED(hr))
     {
+        SetInitializationError(L"Failed to build the irradiance cubemap.\nHRESULT: " + HResultToHex(hr));
         return hr;
     }
 
     hr = CreatePrefilteredEnvironmentMap();
     if (FAILED(hr))
     {
+        SetInitializationError(L"Failed to build the prefiltered environment cubemap.\nHRESULT: " + HResultToHex(hr));
         return hr;
     }
 
     hr = CreateBrdfIntegrationMap();
     if (FAILED(hr))
     {
+        SetInitializationError(L"Failed to build the BRDF integration LUT.\nHRESULT: " + HResultToHex(hr));
         return hr;
     }
 
     m_loadedHdriFileName = hdriFilePath.filename().wstring();
+    m_initializationErrorMessage.clear();
     return S_OK;
 }
 
@@ -1396,44 +2079,51 @@ HRESULT Renderer::CreateBrdfIntegrationMap()
         L"BrdfIntegrationPass");
 }
 
-void Renderer::CreateSceneObjects()
+void Renderer::ReleaseModelResources()
 {
-    m_sphereInstances.clear();
-    m_sphereInstances.reserve(kSphereGridWidth * kSphereGridHeight);
-
-    const float gridWidthOffset = (static_cast<float>(kSphereGridWidth) - 1.0f) * kSphereGridSpacing * 0.5f;
-    const float gridHeightOffset = (static_cast<float>(kSphereGridHeight) - 1.0f) * kSphereGridSpacing * 0.5f;
-
-    for (UINT row = 0; row < kSphereGridHeight; ++row)
-    {
-        for (UINT column = 0; column < kSphereGridWidth; ++column)
-        {
-            const float x = static_cast<float>(column) * kSphereGridSpacing - gridWidthOffset;
-            const float z = static_cast<float>(row) * kSphereGridSpacing - gridHeightOffset;
-            const float roughnessT = static_cast<float>(column) / static_cast<float>(kSphereGridWidth - 1u);
-            const float metalnessT = static_cast<float>(row) / static_cast<float>(kSphereGridHeight - 1u);
-
-            SphereInstance instance = {};
-            instance.world = CreateWorldMatrix(
-                XMFLOAT3(kSphereScale, kSphereScale, kSphereScale),
-                XMFLOAT3(x, 0.0f, z));
-            instance.albedo = XMFLOAT3(0.95f, 0.56f, 0.16f);
-            instance.roughness = std::clamp(0.02f + std::pow(roughnessT, 1.75f) * 0.96f, 0.02f, 0.98f);
-            instance.metalness = std::clamp(metalnessT, 0.0f, 1.0f);
-            instance.emissiveStrength = 0.0f;
-
-            m_sphereInstances.push_back(instance);
-        }
-    }
+    m_modelDrawItems.clear();
+    m_modelPrimitives.clear();
+    m_modelMaterials.clear();
 }
 
 void Renderer::InitializeLights()
 {
-    // Keep the lights low and around the grid so the front-facing parts of the
-    // spheres receive a clear colored contribution when point lights are enabled.
-    m_pointLights[0] = { XMFLOAT3(-6.0f, 2.6f, -7.0f), 18.0f, XMFLOAT3(1.0f, 0.28f, 0.22f), 2.2f };
-    m_pointLights[1] = { XMFLOAT3(0.0f, 4.3f, -8.0f), 20.0f, XMFLOAT3(0.95f, 0.97f, 1.0f), 2.5f };
-    m_pointLights[2] = { XMFLOAT3(6.0f, 2.6f, -7.0f), 18.0f, XMFLOAT3(0.22f, 0.52f, 1.0f), 2.2f };
+    const XMVECTOR boundsMin = XMLoadFloat3(&m_sceneBoundsMin);
+    const XMVECTOR boundsMax = XMLoadFloat3(&m_sceneBoundsMax);
+    const XMVECTOR center = XMVectorScale(XMVectorAdd(boundsMin, boundsMax), 0.5f);
+    const XMVECTOR extents = XMVectorScale(XMVectorSubtract(boundsMax, boundsMin), 0.5f);
+    const float radius = std::max(1.0f, XMVectorGetX(XMVector3Length(extents)));
+
+    XMFLOAT3 centerPoint = {};
+    XMStoreFloat3(&centerPoint, center);
+
+    const float lightRadius = std::max(radius * 4.5f, 8.0f);
+    m_pointLights[0] =
+    {
+        XMFLOAT3(centerPoint.x - radius * 1.4f, centerPoint.y + radius * 0.9f, centerPoint.z - radius * 1.45f),
+        lightRadius,
+        XMFLOAT3(1.0f, 0.28f, 0.22f),
+        2.4f
+    };
+    m_pointLights[1] =
+    {
+        XMFLOAT3(centerPoint.x, centerPoint.y + radius * 1.55f, centerPoint.z - radius * 1.8f),
+        lightRadius,
+        XMFLOAT3(0.95f, 0.97f, 1.0f),
+        2.7f
+    };
+    m_pointLights[2] =
+    {
+        XMFLOAT3(centerPoint.x + radius * 1.4f, centerPoint.y + radius * 0.9f, centerPoint.z - radius * 1.45f),
+        lightRadius,
+        XMFLOAT3(0.22f, 0.52f, 1.0f),
+        2.4f
+    };
+}
+
+void Renderer::SetInitializationError(std::wstring message)
+{
+    m_initializationErrorMessage = std::move(message);
 }
 
 void Renderer::UpdateWindowTitle()
@@ -1466,7 +2156,9 @@ void Renderer::UpdateWindowTitle()
 
     const std::wstring title =
         m_title +
-        L" | 1 PBR | 2 NDF | 3 Geometry | 4 Fresnel | 5 Direct lights | L toggle point lights | Debug modes use analytic preview | Roughness: left->right | Metalness: front->back | HDRI: " +
+        L" | 1 PBR | 2 NDF | 3 Geometry | 4 Fresnel | 5 Direct lights | L toggle point lights | R reset camera | glTF: " +
+        m_loadedSceneFileName +
+        L" | HDRI: " +
         m_loadedHdriFileName +
         L" | Lights " +
         std::wstring(m_pointLightsEnabled ? L"On" : L"Off") +
@@ -1478,10 +2170,16 @@ void Renderer::UpdateWindowTitle()
 
 void Renderer::ResetCamera()
 {
-    m_cameraTarget = XMFLOAT3(0.0f, 0.0f, 0.0f);
-    m_cameraDistance = 17.0f;
-    m_cameraYaw = 0.65f;
-    m_cameraPitch = -0.38f;
+    const XMVECTOR boundsMin = XMLoadFloat3(&m_sceneBoundsMin);
+    const XMVECTOR boundsMax = XMLoadFloat3(&m_sceneBoundsMax);
+    const XMVECTOR center = XMVectorScale(XMVectorAdd(boundsMin, boundsMax), 0.5f);
+    const XMVECTOR extents = XMVectorScale(XMVectorSubtract(boundsMax, boundsMin), 0.5f);
+    const float radius = std::max(1.5f, XMVectorGetX(XMVector3Length(extents)));
+
+    XMStoreFloat3(&m_cameraTarget, center);
+    m_cameraDistance = std::clamp(radius * 3.1f, 4.0f, 55.0f);
+    m_cameraYaw = 0.72f;
+    m_cameraPitch = -0.26f;
     UpdateCamera();
 }
 
@@ -1546,9 +2244,14 @@ void Renderer::RenderEnvironment()
     EndEvent();
 }
 
-void Renderer::RenderSpheres()
+void Renderer::RenderModel()
 {
-    BeginEvent(L"PBRSpherePass");
+    if (m_modelDrawItems.empty())
+    {
+        return;
+    }
+
+    BeginEvent(L"GLTFScenePass");
 
     SceneFrameConstants sceneFrameConstants = {};
     sceneFrameConstants.viewProjection = StoreMatrix(XMLoadFloat4x4(&m_viewMatrix) * XMLoadFloat4x4(&m_projectionMatrix));
@@ -1567,16 +2270,9 @@ void Renderer::RenderSpheres()
         XMFLOAT4(static_cast<float>(static_cast<int>(m_displayMode)), kEnvironmentIntensity, kMaxReflectionLod, 0.0f);
     UpdateConstantBuffer(m_deviceContext.Get(), m_sceneFrameConstantBuffer, sceneFrameConstants);
 
-    const UINT stride = sizeof(SceneVertex);
-    const UINT offset = 0;
-    ID3D11Buffer* vertexBuffers[] = { m_sphereGeometry.vertexBuffer.Get() };
     m_deviceContext->IASetInputLayout(m_sceneInputLayout.Get());
     m_deviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    m_deviceContext->IASetVertexBuffers(0, 1, vertexBuffers, &stride, &offset);
-    m_deviceContext->IASetIndexBuffer(m_sphereGeometry.indexBuffer.Get(), DXGI_FORMAT_R32_UINT, 0);
 
-    m_deviceContext->RSSetState(m_rasterizerState.Get());
-    m_deviceContext->OMSetDepthStencilState(m_depthStencilState.Get(), 0);
     m_deviceContext->VSSetShader(m_pbrSceneVertexShader.Get(), nullptr, 0);
     m_deviceContext->PSSetShader(m_pbrScenePixelShader.Get(), nullptr, 0);
 
@@ -1584,8 +2280,8 @@ void Renderer::RenderSpheres()
     m_deviceContext->VSSetConstantBuffers(0, 1, sceneFrameBuffers);
     m_deviceContext->PSSetConstantBuffers(0, 1, sceneFrameBuffers);
 
-    ID3D11SamplerState* samplers[] = { m_linearClampSampler.Get() };
-    m_deviceContext->PSSetSamplers(0, 1, samplers);
+    ID3D11SamplerState* samplers[] = { m_linearClampSampler.Get(), m_linearWrapSampler.Get() };
+    m_deviceContext->PSSetSamplers(0, ARRAYSIZE(samplers), samplers);
 
     ID3D11ShaderResourceView* shaderResources[] =
     {
@@ -1595,9 +2291,42 @@ void Renderer::RenderSpheres()
     };
     m_deviceContext->PSSetShaderResources(0, ARRAYSIZE(shaderResources), shaderResources);
 
-    for (const SphereInstance& instance : m_sphereInstances)
+    for (const ModelDrawItem& drawItem : m_modelDrawItems)
     {
-        DrawSphereInstance(instance);
+        const ModelPrimitive& primitive = m_modelPrimitives[drawItem.primitiveIndex];
+        const ModelMaterial& material =
+            (primitive.materialIndex < m_modelMaterials.size())
+            ? m_modelMaterials[primitive.materialIndex]
+            : m_modelMaterials.front();
+
+        if (material.alphaMode == Gltf::AlphaMode::Blend)
+        {
+            continue;
+        }
+
+        const float blendFactors[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        m_deviceContext->OMSetDepthStencilState(m_depthStencilState.Get(), 0);
+        m_deviceContext->OMSetBlendState(nullptr, blendFactors, 0xFFFFFFFFu);
+        DrawModelDrawItem(drawItem);
+    }
+
+    const float blendFactors[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    m_deviceContext->OMSetDepthStencilState(m_transparentDepthStencilState.Get(), 0);
+    m_deviceContext->OMSetBlendState(m_alphaBlendState.Get(), blendFactors, 0xFFFFFFFFu);
+    for (const ModelDrawItem& drawItem : m_modelDrawItems)
+    {
+        const ModelPrimitive& primitive = m_modelPrimitives[drawItem.primitiveIndex];
+        const ModelMaterial& material =
+            (primitive.materialIndex < m_modelMaterials.size())
+            ? m_modelMaterials[primitive.materialIndex]
+            : m_modelMaterials.front();
+
+        if (material.alphaMode != Gltf::AlphaMode::Blend)
+        {
+            continue;
+        }
+
+        DrawModelDrawItem(drawItem);
     }
 
     for (size_t lightIndex = 0; lightIndex < m_pointLights.size(); ++lightIndex)
@@ -1608,41 +2337,97 @@ void Renderer::RenderSpheres()
         }
 
         const PointLight& light = m_pointLights[lightIndex];
-        SphereInstance marker = {};
-        marker.world = CreateWorldMatrix(
-            XMFLOAT3(0.34f, 0.34f, 0.34f),
-            light.position);
-        marker.albedo = light.color;
-        marker.roughness = 0.05f;
-        marker.metalness = 1.0f;
-        marker.emissiveStrength = 3.6f;
-        DrawSphereInstance(marker);
+        ModelMaterial markerMaterial = {};
+        markerMaterial.baseColorFactor = XMFLOAT4(light.color.x, light.color.y, light.color.z, 1.0f);
+        markerMaterial.emissiveFactor = XMFLOAT4(light.color.x, light.color.y, light.color.z, 1.0f);
+        markerMaterial.roughnessFactor = 0.05f;
+        markerMaterial.metallicFactor = 1.0f;
+        markerMaterial.occlusionStrength = 1.0f;
+        markerMaterial.alphaCutoff = 0.5f;
+        markerMaterial.doubleSided = false;
+        markerMaterial.alphaMode = Gltf::AlphaMode::Opaque;
+        markerMaterial.baseColorTextureShaderResourceView = m_defaultWhiteSrgbShaderResourceView;
+        markerMaterial.metallicRoughnessTextureShaderResourceView = m_defaultWhiteLinearShaderResourceView;
+        markerMaterial.emissiveTextureShaderResourceView = m_defaultWhiteSrgbShaderResourceView;
+        markerMaterial.occlusionTextureShaderResourceView = m_defaultWhiteLinearShaderResourceView;
+        m_deviceContext->OMSetDepthStencilState(m_depthStencilState.Get(), 0);
+        m_deviceContext->OMSetBlendState(nullptr, blendFactors, 0xFFFFFFFFu);
+        DrawMesh(
+            m_sphereGeometry,
+            CreateWorldMatrix(XMFLOAT3(kLightMarkerScale, kLightMarkerScale, kLightMarkerScale), light.position),
+            markerMaterial,
+            3.6f);
     }
 
-    ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr, nullptr };
+    ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
     m_deviceContext->PSSetShaderResources(0, ARRAYSIZE(nullSrvs), nullSrvs);
+    m_deviceContext->OMSetBlendState(nullptr, blendFactors, 0xFFFFFFFFu);
 
     EndEvent();
 }
 
-void Renderer::DrawSphereInstance(const SphereInstance& object)
+void Renderer::DrawModelDrawItem(const ModelDrawItem& object)
 {
-    const XMMATRIX worldMatrix = XMLoadFloat4x4(&object.world);
+    if (object.primitiveIndex >= m_modelPrimitives.size())
+    {
+        return;
+    }
 
-    // This project uses row-vector matrix math, so normals are transformed by the inverse matrix.
+    const ModelPrimitive& primitive = m_modelPrimitives[object.primitiveIndex];
+    const ModelMaterial& material =
+        (primitive.materialIndex < m_modelMaterials.size())
+        ? m_modelMaterials[primitive.materialIndex]
+        : m_modelMaterials.front();
+    DrawMesh(primitive.geometry, object.world, material);
+}
+
+void Renderer::DrawMesh(
+    const MeshGeometry& geometry,
+    const XMFLOAT4X4& world,
+    const ModelMaterial& material,
+    float emissiveMultiplier)
+{
+    const UINT stride = sizeof(SceneVertex);
+    const UINT offset = 0;
+    ID3D11Buffer* vertexBuffers[] = { geometry.vertexBuffer.Get() };
+    m_deviceContext->IASetVertexBuffers(0, 1, vertexBuffers, &stride, &offset);
+    m_deviceContext->IASetIndexBuffer(geometry.indexBuffer.Get(), DXGI_FORMAT_R32_UINT, 0);
+    m_deviceContext->RSSetState(material.doubleSided ? m_doubleSidedRasterizerState.Get() : m_rasterizerState.Get());
+
+    const XMMATRIX worldMatrix = XMLoadFloat4x4(&world);
     const XMMATRIX normalMatrix = XMMatrixInverse(nullptr, worldMatrix);
 
     SceneObjectConstants objectConstants = {};
     objectConstants.world = StoreMatrix(worldMatrix);
     objectConstants.normalMatrix = StoreMatrix(normalMatrix);
-    objectConstants.albedo = XMFLOAT4(object.albedo.x, object.albedo.y, object.albedo.z, 1.0f);
-    objectConstants.materialParameters = XMFLOAT4(object.roughness, object.metalness, object.emissiveStrength, 0.0f);
+    objectConstants.baseColorFactor = material.baseColorFactor;
+    objectConstants.emissiveFactor = XMFLOAT4(
+        material.emissiveFactor.x * emissiveMultiplier,
+        material.emissiveFactor.y * emissiveMultiplier,
+        material.emissiveFactor.z * emissiveMultiplier,
+        material.emissiveFactor.w);
+    objectConstants.materialParameters = XMFLOAT4(
+        material.roughnessFactor,
+        material.metallicFactor,
+        material.occlusionStrength,
+        material.alphaCutoff);
+    objectConstants.materialFlags = XMFLOAT4(static_cast<float>(static_cast<int>(material.alphaMode)), 0.0f, 0.0f, 0.0f);
     UpdateConstantBuffer(m_deviceContext.Get(), m_sceneObjectConstantBuffer, objectConstants);
 
     ID3D11Buffer* objectBuffers[] = { m_sceneObjectConstantBuffer.Get() };
     m_deviceContext->VSSetConstantBuffers(1, 1, objectBuffers);
     m_deviceContext->PSSetConstantBuffers(1, 1, objectBuffers);
-    m_deviceContext->DrawIndexed(m_sphereGeometry.indexCount, 0, 0);
+
+    ID3D11ShaderResourceView* materialShaderResources[] =
+    {
+        material.baseColorTextureShaderResourceView.Get(),
+        material.metallicRoughnessTextureShaderResourceView.Get(),
+        material.emissiveTextureShaderResourceView.Get(),
+        material.occlusionTextureShaderResourceView.Get(),
+    };
+    m_deviceContext->PSSetShaderResources(3, ARRAYSIZE(materialShaderResources), materialShaderResources);
+
+    m_deviceContext->DrawIndexed(geometry.indexCount, 0, 0);
 }
 
 HRESULT Renderer::CompileShader(const std::wstring& shaderFile, const std::string& entryPoint,
@@ -1854,6 +2639,45 @@ fs::path Renderer::FindHdriFile() const
     return candidateFiles.front();
 }
 
+fs::path Renderer::FindSceneFile() const
+{
+    const fs::path executableDirectory = GetExecutableDirectory();
+
+    std::error_code errorCode;
+    const fs::path currentDirectory = fs::current_path(errorCode);
+
+    std::vector<fs::path> searchDirectories;
+    searchDirectories.emplace_back(executableDirectory / L"assets" / L"models");
+
+    if (!currentDirectory.empty())
+    {
+        searchDirectories.emplace_back(currentDirectory / L"assets" / L"models");
+        searchDirectories.emplace_back(currentDirectory / L"ibl-diffuse" / L"assets" / L"models");
+    }
+
+    const fs::path twoLevelsUp = executableDirectory.parent_path().parent_path();
+    if (!twoLevelsUp.empty())
+    {
+        searchDirectories.emplace_back(twoLevelsUp / L"assets" / L"models");
+        searchDirectories.emplace_back(twoLevelsUp / L"ibl-diffuse" / L"assets" / L"models");
+    }
+
+    std::vector<fs::path> candidateFiles;
+    for (const fs::path& directory : searchDirectories)
+    {
+        AppendSceneFilesFromDirectory(directory, candidateFiles);
+    }
+
+    if (candidateFiles.empty())
+    {
+        return {};
+    }
+
+    std::sort(candidateFiles.begin(), candidateFiles.end());
+    candidateFiles.erase(std::unique(candidateFiles.begin(), candidateFiles.end()), candidateFiles.end());
+    return candidateFiles.front();
+}
+
 void Renderer::Render()
 {
     if (m_isMinimized || m_width == 0 || m_height == 0)
@@ -1873,7 +2697,7 @@ void Renderer::Render()
     m_deviceContext->ClearDepthStencilView(m_depthStencilView.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
 
     RenderEnvironment();
-    RenderSpheres();
+    RenderModel();
 
     const HRESULT hr = m_swapChain->Present(1, 0);
     if (FAILED(hr))
@@ -1920,6 +2744,7 @@ void Renderer::Cleanup()
 
     ReleaseWindowSizeResources();
 
+    ReleaseModelResources();
     m_sphereGeometry = {};
     m_environmentSphereGeometry = {};
     m_captureConstantBuffer.Reset();
@@ -1938,6 +2763,7 @@ void Renderer::Cleanup()
     m_skyVertexShader.Reset();
     m_skyPixelShader.Reset();
     m_linearClampSampler.Reset();
+    m_linearWrapSampler.Reset();
     m_brdfIntegrationShaderResourceView.Reset();
     m_brdfIntegrationTexture.Reset();
     m_prefilteredEnvironmentCubemapShaderResourceView.Reset();
@@ -1948,14 +2774,25 @@ void Renderer::Cleanup()
     m_hdriTexture.Reset();
     m_environmentCubemapShaderResourceView.Reset();
     m_environmentCubemap.Reset();
+    m_defaultWhiteLinearShaderResourceView.Reset();
+    m_defaultWhiteSrgbShaderResourceView.Reset();
     m_skyDepthStencilState.Reset();
+    m_transparentDepthStencilState.Reset();
     m_depthStencilState.Reset();
+    m_alphaBlendState.Reset();
     m_skyRasterizerState.Reset();
+    m_doubleSidedRasterizerState.Reset();
     m_rasterizerState.Reset();
     m_annotation.Reset();
     m_swapChain.Reset();
     m_deviceContext.Reset();
     m_device.Reset();
+
+    if (m_comInitialized)
+    {
+        CoUninitialize();
+        m_comInitialized = false;
+    }
 }
 
 LRESULT Renderer::HandleWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)

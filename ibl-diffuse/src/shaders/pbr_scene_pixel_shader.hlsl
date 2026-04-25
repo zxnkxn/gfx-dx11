@@ -20,8 +20,10 @@ cbuffer SceneObjectConstants : register(b1)
 {
     row_major float4x4 world;
     row_major float4x4 normalMatrix;
-    float4 albedo;
+    float4 baseColorFactor;
+    float4 emissiveFactor;
     float4 materialParameters;
+    float4 materialFlags;
 };
 
 struct PSInput
@@ -29,15 +31,18 @@ struct PSInput
     float4 position : SV_POSITION;
     float3 worldPosition : TEXCOORD0;
     float3 normal : TEXCOORD1;
-    float3 albedo : TEXCOORD2;
-    float roughness : TEXCOORD3;
-    float metalness : TEXCOORD4;
+    float2 texCoord : TEXCOORD2;
 };
 
 TextureCube<float4> irradianceMap : register(t0);
 TextureCube<float4> prefilteredEnvironmentMap : register(t1);
 Texture2D<float4> brdfIntegrationMap : register(t2);
+Texture2D<float4> baseColorTexture : register(t3);
+Texture2D<float4> metallicRoughnessTexture : register(t4);
+Texture2D<float4> emissiveTexture : register(t5);
+Texture2D<float4> occlusionTexture : register(t6);
 SamplerState linearClampSampler : register(s0);
+SamplerState linearWrapSampler : register(s1);
 
 float DistributionGGX(float NdotH, float roughness)
 {
@@ -100,20 +105,33 @@ float4 PS(PSInput input) : SV_Target
     // the opposite winding/normal orientation.
     const float3 N = (dot(geometricNormal, V) >= 0.0f) ? geometricNormal : -geometricNormal;
     const int displayMode = (int)globalParameters.x;
+    const int alphaMode = (int)materialFlags.x;
 
-    const float clampedRoughness = clamp(input.roughness, 0.045f, 1.0f);
-    const float clampedMetalness = clamp(input.metalness, 0.0f, 1.0f);
-    const float3 albedoColor = clamp(input.albedo, 0.0f.xxx, 1.0f.xxx);
-    const float emissiveStrength = max(materialParameters.z, 0.0f);
+    const float4 sampledBaseColor = baseColorTexture.Sample(linearWrapSampler, input.texCoord);
+    const float4 sampledMetallicRoughness = metallicRoughnessTexture.Sample(linearWrapSampler, input.texCoord);
+    const float3 sampledEmissive = emissiveTexture.Sample(linearWrapSampler, input.texCoord).rgb;
+    const float sampledOcclusion = occlusionTexture.Sample(linearWrapSampler, input.texCoord).r;
+
+    const float alpha = saturate(baseColorFactor.a * sampledBaseColor.a);
+    if (alphaMode == 1 && alpha < materialParameters.w)
+    {
+        discard;
+    }
+
+    const float clampedRoughness = clamp(materialParameters.x * sampledMetallicRoughness.g, 0.045f, 1.0f);
+    const float clampedMetalness = clamp(materialParameters.y * sampledMetallicRoughness.b, 0.0f, 1.0f);
+    const float ambientOcclusion = lerp(1.0f, saturate(sampledOcclusion), saturate(materialParameters.z));
+    const float3 albedoColor = clamp(baseColorFactor.rgb * sampledBaseColor.rgb, 0.0f.xxx, 1.0f.xxx);
+    const float3 emissiveColorLinear = max(emissiveFactor.rgb * sampledEmissive, 0.0f.xxx);
 
     const float3 dielectricF0 = float3(0.04f, 0.04f, 0.04f);
     const float3 F0 = lerp(dielectricF0, albedoColor, clampedMetalness);
 
-    if (emissiveStrength > 0.0f)
+    if (any(emissiveColorLinear > 0.0f))
     {
-        const float3 emissiveColor = ToneMapReinhard(albedoColor * emissiveStrength);
+        const float3 emissiveColor = ToneMapReinhard(emissiveColorLinear);
         const float3 gammaCorrectedEmissive = pow(clamp(emissiveColor, 0.0f.xxx, 1.0f.xxx), 1.0f / 2.2f);
-        return float4(gammaCorrectedEmissive, 1.0f);
+        return float4(gammaCorrectedEmissive, (alphaMode == 2) ? alpha : 1.0f);
     }
 
     if (displayMode != 0 && displayMode != 4)
@@ -151,18 +169,18 @@ float4 PS(PSInput input) : SV_Target
             const float distributionValue =
                 pow(clamp(log2(1.0f + debugDistribution * 96.0f) / 7.0f, 0.0f, 1.0f), 0.42f);
             const float3 debugColor = pow(lerp(0.08f.xxx, 1.0f.xxx, distributionValue), 1.0f / 2.2f);
-            return float4(debugColor, 1.0f);
+            return float4(debugColor, (alphaMode == 2) ? alpha : 1.0f);
         }
 
         if (displayMode == 2)
         {
             const float geometryValue = pow(clamp(debugGeometry, 0.0f, 1.0f), 0.55f);
             const float3 debugColor = pow(lerp(0.08f.xxx, 1.0f.xxx, geometryValue), 1.0f / 2.2f);
-            return float4(debugColor, 1.0f);
+            return float4(debugColor, (alphaMode == 2) ? alpha : 1.0f);
         }
 
         const float3 debugColor = pow(clamp(debugFresnel, 0.0f.xxx, 1.0f.xxx), 1.0f / 2.2f);
-        return float4(debugColor, 1.0f);
+        return float4(debugColor, (alphaMode == 2) ? alpha : 1.0f);
     }
 
     float3 radianceSum = 0.0f.xxx;
@@ -242,8 +260,8 @@ float4 PS(PSInput input) : SV_Target
     const float3 ambient = (kDambient * ambientDiffuse + ambientSpecular) * max(globalParameters.y, 0.0f);
 
     const float exposure = 1.2f;
-    const float3 finalColor = (displayMode == 4) ? radianceSum : (ambient + radianceSum);
+    const float3 finalColor = ((displayMode == 4) ? radianceSum : (ambient + radianceSum)) * ambientOcclusion;
     const float3 toneMappedColor = ToneMapReinhard(max(finalColor * exposure, 0.0f.xxx));
     const float3 gammaCorrectedColor = pow(clamp(toneMappedColor, 0.0f.xxx, 1.0f.xxx), 1.0f / 2.2f);
-    return float4(gammaCorrectedColor, 1.0f);
+    return float4(gammaCorrectedColor, (alphaMode == 2) ? alpha : 1.0f);
 }

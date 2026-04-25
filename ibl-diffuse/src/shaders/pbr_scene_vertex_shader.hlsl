@@ -16,14 +16,17 @@ cbuffer SceneObjectConstants : register(b1)
 {
     row_major float4x4 world;
     row_major float4x4 normalMatrix;
-    float4 albedo;
+    float4 baseColorFactor;
+    float4 emissiveFactor;
     float4 materialParameters;
+    float4 materialFlags;
 };
 
 struct VSInput
 {
     float3 position : POSITION;
     float3 normal : NORMAL;
+    float2 texCoord : TEXCOORD0;
 };
 
 struct PSInput
@@ -31,9 +34,7 @@ struct PSInput
     float4 position : SV_POSITION;
     float3 worldPosition : TEXCOORD0;
     float3 normal : TEXCOORD1;
-    float3 albedo : TEXCOORD2;
-    float roughness : TEXCOORD3;
-    float metalness : TEXCOORD4;
+    float2 texCoord : TEXCOORD2;
 };
 
 PSInput VS(VSInput input)
@@ -44,9 +45,7 @@ PSInput VS(VSInput input)
     output.position = mul(worldPosition, viewProjection);
     output.worldPosition = worldPosition.xyz;
     output.normal = normalize(mul(float4(input.normal, 0.0f), normalMatrix).xyz);
-    output.albedo = albedo.rgb;
-    output.roughness = materialParameters.x;
-    output.metalness = materialParameters.y;
+    output.texCoord = input.texCoord;
 
     return output;
 }

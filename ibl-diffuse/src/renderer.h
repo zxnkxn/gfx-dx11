@@ -11,11 +11,14 @@
 #include <string>
 #include <vector>
 
+#include "gltf_loader.h"
+
 // Include the DirectX libraries
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dxguid.lib")
+#pragma comment(lib, "windowscodecs.lib")
 
 class Renderer
 {
@@ -25,6 +28,7 @@ public:
 
     // Initialize the DirectX application
     HRESULT Initialize(HINSTANCE hInstance, int nCmdShow);
+    const std::wstring& GetInitializationErrorMessage() const;
 
     // Render a frame
     void Render();
@@ -50,20 +54,39 @@ private:
         float intensity;
     };
 
-    struct SphereInstance
-    {
-        DirectX::XMFLOAT4X4 world;
-        DirectX::XMFLOAT3 albedo;
-        float roughness;
-        float metalness;
-        float emissiveStrength;
-    };
-
     struct MeshGeometry
     {
         Microsoft::WRL::ComPtr<ID3D11Buffer> vertexBuffer;
         Microsoft::WRL::ComPtr<ID3D11Buffer> indexBuffer;
         UINT indexCount = 0;
+    };
+
+    struct ModelMaterial
+    {
+        DirectX::XMFLOAT4 baseColorFactor;
+        DirectX::XMFLOAT4 emissiveFactor;
+        float roughnessFactor;
+        float metallicFactor;
+        float occlusionStrength;
+        float alphaCutoff;
+        bool doubleSided;
+        Gltf::AlphaMode alphaMode = Gltf::AlphaMode::Opaque;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> baseColorTextureShaderResourceView;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> metallicRoughnessTextureShaderResourceView;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> emissiveTextureShaderResourceView;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> occlusionTextureShaderResourceView;
+    };
+
+    struct ModelPrimitive
+    {
+        MeshGeometry geometry;
+        size_t materialIndex = 0;
+    };
+
+    struct ModelDrawItem
+    {
+        size_t primitiveIndex = 0;
+        DirectX::XMFLOAT4X4 world;
     };
 
     struct PointLightGpu
@@ -84,8 +107,10 @@ private:
     {
         DirectX::XMFLOAT4X4 world;
         DirectX::XMFLOAT4X4 normalMatrix;
-        DirectX::XMFLOAT4 albedo;
+        DirectX::XMFLOAT4 baseColorFactor;
+        DirectX::XMFLOAT4 emissiveFactor;
         DirectX::XMFLOAT4 materialParameters;
+        DirectX::XMFLOAT4 materialFlags;
     };
 
     struct SkyFrameConstants
@@ -115,6 +140,17 @@ private:
     HRESULT CreateShaders();
     HRESULT CreateGeometry();
     HRESULT CreateSphereMeshGeometry(UINT latitudeSegments, UINT longitudeSegments, MeshGeometry& geometry, const char* debugName);
+    HRESULT LoadSceneModel();
+    HRESULT CreateSolidColorTexture(
+        const DirectX::XMFLOAT4& color,
+        DXGI_FORMAT shaderResourceFormat,
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>& shaderResourceView,
+        const char* debugNamePrefix);
+    HRESULT CreateTextureFromEncodedImage(
+        const Gltf::Image& image,
+        DXGI_FORMAT shaderResourceFormat,
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>& shaderResourceView,
+        const char* debugNamePrefix);
     HRESULT CreateEnvironmentCubemap();
     HRESULT CreateHdriTexture(const struct HdriImage& image);
     HRESULT CreateFloatCubemap(
@@ -148,9 +184,10 @@ private:
         UINT height,
         ID3D11PixelShader* pixelShader,
         const wchar_t* eventName);
-    void CreateSceneObjects();
     void InitializeLights();
+    void SetInitializationError(std::wstring message);
     void UpdateWindowTitle();
+    void ReleaseModelResources();
 
     // Window-size dependent resources
     HRESULT CreateWindowSizeResources();
@@ -163,8 +200,13 @@ private:
     void ResetCamera();
     void UpdateCamera();
     void RenderEnvironment();
-    void RenderSpheres();
-    void DrawSphereInstance(const SphereInstance& object);
+    void RenderModel();
+    void DrawModelDrawItem(const ModelDrawItem& object);
+    void DrawMesh(
+        const MeshGeometry& geometry,
+        const DirectX::XMFLOAT4X4& world,
+        const ModelMaterial& material,
+        float emissiveMultiplier = 1.0f);
 
     // Shader and resource helpers
     HRESULT CompileShader(const std::wstring& shaderFile, const std::string& entryPoint,
@@ -177,6 +219,7 @@ private:
     void BeginEvent(const wchar_t* name) const;
     void EndEvent() const;
     std::filesystem::path FindHdriFile() const;
+    std::filesystem::path FindSceneFile() const;
 
     // Window procedure
     LRESULT HandleWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
@@ -190,6 +233,8 @@ private:
     UINT m_height;
     bool m_isMinimized;
     std::wstring m_title;
+    std::wstring m_initializationErrorMessage;
+    bool m_comInitialized;
 
     // Input and camera
     bool m_isOrbiting;
@@ -203,11 +248,16 @@ private:
     DirectX::XMFLOAT4X4 m_projectionMatrix;
 
     // Scene state
-    std::vector<SphereInstance> m_sphereInstances;
+    std::vector<ModelMaterial> m_modelMaterials;
+    std::vector<ModelPrimitive> m_modelPrimitives;
+    std::vector<ModelDrawItem> m_modelDrawItems;
     std::array<PointLight, 3> m_pointLights;
     DisplayMode m_displayMode;
     bool m_pointLightsEnabled;
     std::wstring m_loadedHdriFileName;
+    std::wstring m_loadedSceneFileName;
+    DirectX::XMFLOAT3 m_sceneBoundsMin;
+    DirectX::XMFLOAT3 m_sceneBoundsMax;
 
     // DirectX core objects
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
@@ -217,9 +267,12 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_depthStencilBuffer;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilView> m_depthStencilView;
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> m_rasterizerState;
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> m_doubleSidedRasterizerState;
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> m_skyRasterizerState;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> m_depthStencilState;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> m_transparentDepthStencilState;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> m_skyDepthStencilState;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> m_alphaBlendState;
     Microsoft::WRL::ComPtr<ID3DUserDefinedAnnotation> m_annotation;
 
     // Geometry
@@ -239,6 +292,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_brdfIntegrationPixelShader;
     Microsoft::WRL::ComPtr<ID3D11InputLayout> m_sceneInputLayout;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> m_linearClampSampler;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> m_linearWrapSampler;
 
     // Constant buffers
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_sceneFrameConstantBuffer;
@@ -257,6 +311,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_prefilteredEnvironmentCubemapShaderResourceView;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_brdfIntegrationTexture;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_brdfIntegrationShaderResourceView;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_defaultWhiteLinearShaderResourceView;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_defaultWhiteSrgbShaderResourceView;
 
     // Debug layer state
     bool m_debugLayerEnabled;

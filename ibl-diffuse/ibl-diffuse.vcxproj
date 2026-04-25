@@ -139,11 +139,13 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="src\gltf_loader.cpp" />
     <ClCompile Include="src\hdri_loader.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\renderer.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\gltf_loader.h" />
     <ClInclude Include="src\hdri_loader.h" />
     <ClInclude Include="src\renderer.h" />
   </ItemGroup>
@@ -311,6 +313,9 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="assets\hdri\*.hdr">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="assets\models\*.glb">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <None Include="assets\hdri\PLACE_HDRI_HERE.txt" />
