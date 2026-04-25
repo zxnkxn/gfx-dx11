@@ -43,6 +43,12 @@
     <FxCompile Include="src\shaders\brdf_integration_pixel_shader.hlsl">
       <Filter>Shader Files</Filter>
     </FxCompile>
+    <FxCompile Include="src\shaders\bloom_blur_pixel_shader.hlsl">
+      <Filter>Shader Files</Filter>
+    </FxCompile>
+    <FxCompile Include="src\shaders\bloom_composite_pixel_shader.hlsl">
+      <Filter>Shader Files</Filter>
+    </FxCompile>
     <FxCompile Include="src\shaders\cubemap_capture_vertex_shader.hlsl">
       <Filter>Shader Files</Filter>
     </FxCompile>

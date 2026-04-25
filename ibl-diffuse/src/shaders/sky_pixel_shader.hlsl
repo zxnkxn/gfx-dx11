@@ -10,14 +10,22 @@ struct PSInput
     float3 worldPosition : TEXCOORD0;
 };
 
+struct PSOutput
+{
+    float4 sceneColor : SV_Target0;
+    float4 bloomMask : SV_Target1;
+};
+
 TextureCube<float4> environmentMap : register(t0);
 SamplerState linearClampSampler : register(s0);
 
-float4 PS(PSInput input) : SV_Target
+PSOutput PS(PSInput input)
 {
+    PSOutput output = (PSOutput)0;
+
     const float3 direction = normalize(input.worldPosition - cameraPosition.xyz);
     const float3 environmentColor = environmentMap.SampleLevel(linearClampSampler, direction, 0.0f).rgb;
-    const float3 toneMappedColor = environmentColor / (1.0f.xxx + environmentColor);
-    const float3 gammaCorrectedColor = pow(clamp(toneMappedColor, 0.0f.xxx, 1.0f.xxx), 1.0f / 2.2f);
-    return float4(gammaCorrectedColor, 1.0f);
+    output.sceneColor = float4(environmentColor, 1.0f);
+    output.bloomMask = float4(0.0f, 0.0f, 0.0f, 1.0f);
+    return output;
 }

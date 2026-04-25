@@ -127,6 +127,13 @@ private:
         DirectX::XMFLOAT4 prefilterParameters;
     };
 
+    struct PostProcessConstants
+    {
+        DirectX::XMFLOAT2 inverseTextureSize;
+        DirectX::XMFLOAT2 blurDirection;
+        DirectX::XMFLOAT4 parameters;
+    };
+
 private:
     // Window and application setup
     HRESULT RegisterWindowClass(HINSTANCE hInstance);
@@ -178,6 +185,10 @@ private:
         Microsoft::WRL::ComPtr<ID3D11Texture2D>& texture,
         Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>& shaderResourceView,
         const char* debugNamePrefix);
+    HRESULT CreateTextureRenderTargetView(
+        ID3D11Texture2D* texture,
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView>& renderTargetView,
+        const char* debugNamePrefix);
     HRESULT RenderFullscreenTexture(
         ID3D11Texture2D* targetTexture,
         UINT width,
@@ -201,6 +212,8 @@ private:
     void UpdateCamera();
     void RenderEnvironment();
     void RenderModel();
+    void ApplyBloom();
+    void CompositeScene();
     void DrawModelDrawItem(const ModelDrawItem& object);
     void DrawMesh(
         const MeshGeometry& geometry,
@@ -258,6 +271,9 @@ private:
     std::wstring m_loadedSceneFileName;
     DirectX::XMFLOAT3 m_sceneBoundsMin;
     DirectX::XMFLOAT3 m_sceneBoundsMax;
+    bool m_bloomEnabled;
+    float m_bloomIntensity;
+    float m_bloomThreshold;
 
     // DirectX core objects
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
@@ -290,6 +306,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_irradianceConvolutionPixelShader;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_prefilterEnvironmentPixelShader;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_brdfIntegrationPixelShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_bloomBlurPixelShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_bloomCompositePixelShader;
     Microsoft::WRL::ComPtr<ID3D11InputLayout> m_sceneInputLayout;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> m_linearClampSampler;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> m_linearWrapSampler;
@@ -299,6 +317,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_sceneObjectConstantBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_skyFrameConstantBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_captureConstantBuffer;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_postProcessConstantBuffer;
 
     // Environment resources
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_hdriTexture;
@@ -313,6 +332,18 @@ private:
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_brdfIntegrationShaderResourceView;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_defaultWhiteLinearShaderResourceView;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_defaultWhiteSrgbShaderResourceView;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_hdrSceneTexture;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_hdrSceneRenderTargetView;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_hdrSceneShaderResourceView;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_bloomTextureA;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_bloomTextureARenderTargetView;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_bloomTextureAShaderResourceView;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_bloomTextureB;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_bloomTextureBRenderTargetView;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_bloomTextureBShaderResourceView;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_bloomSourceTexture;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_bloomSourceRenderTargetView;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_bloomSourceShaderResourceView;
 
     // Debug layer state
     bool m_debugLayerEnabled;

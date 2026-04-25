@@ -40,6 +40,7 @@ namespace
     constexpr float kTargetSceneRadius = 2.5f;
     constexpr float kMaxReflectionLod = static_cast<float>(kPrefilteredEnvironmentCubemapMipLevels - 1u);
     constexpr float kLightMarkerScale = 0.18f;
+    constexpr UINT kBloomBlurPairCount = 5;
 
     struct CubemapCaptureFace
     {
@@ -279,6 +280,9 @@ Renderer::Renderer() :
     m_loadedSceneFileName(L"No glTF"),
     m_sceneBoundsMin(-1.0f, -1.0f, -1.0f),
     m_sceneBoundsMax(1.0f, 1.0f, 1.0f),
+    m_bloomEnabled(true),
+    m_bloomIntensity(1.0f),
+    m_bloomThreshold(0.55f),
     m_debugLayerEnabled(false)
 {
     XMStoreFloat4x4(&m_viewMatrix, XMMatrixIdentity());
@@ -647,6 +651,86 @@ HRESULT Renderer::CreateWindowSizeResources()
         return hr;
     }
 
+    hr = CreateFloatTexture2D(
+        m_width,
+        m_height,
+        m_hdrSceneTexture,
+        m_hdrSceneShaderResourceView,
+        "GLTFHdrScene");
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = CreateTextureRenderTargetView(
+        m_hdrSceneTexture.Get(),
+        m_hdrSceneRenderTargetView,
+        "GLTFHdrScene.RTV");
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = CreateFloatTexture2D(
+        m_width,
+        m_height,
+        m_bloomSourceTexture,
+        m_bloomSourceShaderResourceView,
+        "GLTFBloomSource");
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = CreateTextureRenderTargetView(
+        m_bloomSourceTexture.Get(),
+        m_bloomSourceRenderTargetView,
+        "GLTFBloomSource.RTV");
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = CreateFloatTexture2D(
+        m_width,
+        m_height,
+        m_bloomTextureA,
+        m_bloomTextureAShaderResourceView,
+        "GLTFBloomTextureA");
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = CreateTextureRenderTargetView(
+        m_bloomTextureA.Get(),
+        m_bloomTextureARenderTargetView,
+        "GLTFBloomTextureA.RTV");
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = CreateFloatTexture2D(
+        m_width,
+        m_height,
+        m_bloomTextureB,
+        m_bloomTextureBShaderResourceView,
+        "GLTFBloomTextureB");
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = CreateTextureRenderTargetView(
+        m_bloomTextureB.Get(),
+        m_bloomTextureBRenderTargetView,
+        "GLTFBloomTextureB.RTV");
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
     SetViewport(m_width, m_height);
     return S_OK;
 }
@@ -709,6 +793,18 @@ HRESULT Renderer::CreateDepthStencilBuffer()
 
 void Renderer::ReleaseWindowSizeResources()
 {
+    m_bloomSourceShaderResourceView.Reset();
+    m_bloomSourceRenderTargetView.Reset();
+    m_bloomSourceTexture.Reset();
+    m_bloomTextureBShaderResourceView.Reset();
+    m_bloomTextureBRenderTargetView.Reset();
+    m_bloomTextureB.Reset();
+    m_bloomTextureAShaderResourceView.Reset();
+    m_bloomTextureARenderTargetView.Reset();
+    m_bloomTextureA.Reset();
+    m_hdrSceneShaderResourceView.Reset();
+    m_hdrSceneRenderTargetView.Reset();
+    m_hdrSceneTexture.Reset();
     m_renderTargetView.Reset();
     m_depthStencilView.Reset();
     m_depthStencilBuffer.Reset();
@@ -855,7 +951,13 @@ HRESULT Renderer::CreateConstantBuffers()
         return hr;
     }
 
-    return CreateConstantBuffer<CaptureConstants>(m_device.Get(), m_captureConstantBuffer, "IBLDiffuseCaptureCB");
+    hr = CreateConstantBuffer<CaptureConstants>(m_device.Get(), m_captureConstantBuffer, "IBLDiffuseCaptureCB");
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    return CreateConstantBuffer<PostProcessConstants>(m_device.Get(), m_postProcessConstantBuffer, "GLTFPostProcessCB");
 }
 
 HRESULT Renderer::CreateShaders()
@@ -1052,6 +1154,26 @@ HRESULT Renderer::CreateShaders()
         L"src\\shaders\\brdf_integration_pixel_shader.hlsl",
         "IBLSpecularBrdfIntegrationPixelShader",
         m_brdfIntegrationPixelShader.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = createPixelShader(
+        L"bloom_blur_pixel_shader.cso",
+        L"src\\shaders\\bloom_blur_pixel_shader.hlsl",
+        "GLTFBloomBlurPixelShader",
+        m_bloomBlurPixelShader.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = createPixelShader(
+        L"bloom_composite_pixel_shader.cso",
+        L"src\\shaders\\bloom_composite_pixel_shader.hlsl",
+        "GLTFBloomCompositePixelShader",
+        m_bloomCompositePixelShader.ReleaseAndGetAddressOf());
     if (FAILED(hr))
     {
         return hr;
@@ -2009,6 +2131,29 @@ HRESULT Renderer::CreateFloatTexture2D(
     return S_OK;
 }
 
+HRESULT Renderer::CreateTextureRenderTargetView(
+    ID3D11Texture2D* texture,
+    ComPtr<ID3D11RenderTargetView>& renderTargetView,
+    const char* debugNamePrefix)
+{
+    if (texture == nullptr)
+    {
+        return E_POINTER;
+    }
+
+    HRESULT hr = m_device->CreateRenderTargetView(
+        texture,
+        nullptr,
+        renderTargetView.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    SetDebugName(renderTargetView.Get(), debugNamePrefix);
+    return S_OK;
+}
+
 HRESULT Renderer::RenderFullscreenTexture(
     ID3D11Texture2D* targetTexture,
     UINT width,
@@ -2097,6 +2242,34 @@ void Renderer::InitializeLights()
     XMFLOAT3 centerPoint = {};
     XMStoreFloat3(&centerPoint, center);
 
+    const bool isMetalSphereDemo = (_wcsicmp(m_loadedSceneFileName.c_str(), L"MetalSphere.gltf") == 0);
+    if (isMetalSphereDemo)
+    {
+        const float demoLightRadius = std::max(radius * 2.4f, 4.0f);
+        m_pointLights[0] =
+        {
+            XMFLOAT3(centerPoint.x - radius * 1.25f, centerPoint.y + radius * 0.35f, centerPoint.z - radius * 1.15f),
+            demoLightRadius,
+            XMFLOAT3(1.0f, 0.35f, 0.25f),
+            10.0f
+        };
+        m_pointLights[1] =
+        {
+            XMFLOAT3(centerPoint.x, centerPoint.y + radius * 1.1f, centerPoint.z - radius * 1.0f),
+            demoLightRadius,
+            XMFLOAT3(1.0f, 0.98f, 0.95f),
+            12.0f
+        };
+        m_pointLights[2] =
+        {
+            XMFLOAT3(centerPoint.x + radius * 1.25f, centerPoint.y + radius * 0.35f, centerPoint.z - radius * 1.15f),
+            demoLightRadius,
+            XMFLOAT3(0.25f, 0.55f, 1.0f),
+            10.0f
+        };
+        return;
+    }
+
     const float lightRadius = std::max(radius * 4.5f, 8.0f);
     m_pointLights[0] =
     {
@@ -2156,14 +2329,14 @@ void Renderer::UpdateWindowTitle()
 
     const std::wstring title =
         m_title +
-        L" | 1 PBR | 2 NDF | 3 Geometry | 4 Fresnel | 5 Direct lights | L toggle point lights | R reset camera | glTF: " +
-        m_loadedSceneFileName +
-        L" | HDRI: " +
-        m_loadedHdriFileName +
-        L" | Lights " +
+        L" | B: Bloom " +
+        std::wstring(m_bloomEnabled ? L"On" : L"Off") +
+        L" | L: Lights " +
         std::wstring(m_pointLightsEnabled ? L"On" : L"Off") +
-        L" | Mode " +
-        std::wstring(modeName);
+        L" | R: Reset | 1-5: View | Mode: " +
+        std::wstring(modeName) +
+        L" | Model: " +
+        m_loadedSceneFileName;
 
     SetWindowTextW(m_hwnd, title.c_str());
 }
@@ -2267,7 +2440,11 @@ void Renderer::RenderModel()
     }
 
     sceneFrameConstants.globalParameters =
-        XMFLOAT4(static_cast<float>(static_cast<int>(m_displayMode)), kEnvironmentIntensity, kMaxReflectionLod, 0.0f);
+        XMFLOAT4(
+            static_cast<float>(static_cast<int>(m_displayMode)),
+            kEnvironmentIntensity,
+            kMaxReflectionLod,
+            m_bloomThreshold);
     UpdateConstantBuffer(m_deviceContext.Get(), m_sceneFrameConstantBuffer, sceneFrameConstants);
 
     m_deviceContext->IASetInputLayout(m_sceneInputLayout.Get());
@@ -2356,12 +2533,148 @@ void Renderer::RenderModel()
             m_sphereGeometry,
             CreateWorldMatrix(XMFLOAT3(kLightMarkerScale, kLightMarkerScale, kLightMarkerScale), light.position),
             markerMaterial,
-            3.6f);
+            6.0f);
     }
 
     ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
     m_deviceContext->PSSetShaderResources(0, ARRAYSIZE(nullSrvs), nullSrvs);
     m_deviceContext->OMSetBlendState(nullptr, blendFactors, 0xFFFFFFFFu);
+
+    EndEvent();
+}
+
+void Renderer::ApplyBloom()
+{
+    if (!m_bloomEnabled ||
+        m_bloomBlurPixelShader == nullptr ||
+        m_fullscreenVertexShader == nullptr ||
+        m_postProcessConstantBuffer == nullptr ||
+        m_bloomSourceShaderResourceView == nullptr ||
+        m_bloomTextureAShaderResourceView == nullptr ||
+        m_bloomTextureARenderTargetView == nullptr ||
+        m_bloomTextureBShaderResourceView == nullptr ||
+        m_bloomTextureBRenderTargetView == nullptr)
+    {
+        return;
+    }
+
+    BeginEvent(L"BloomPass");
+
+    const float clearColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const XMFLOAT2 inverseTextureSize(
+        (m_width > 0) ? (1.0f / static_cast<float>(m_width)) : 0.0f,
+        (m_height > 0) ? (1.0f / static_cast<float>(m_height)) : 0.0f);
+
+    ID3D11Buffer* postProcessBuffers[] = { m_postProcessConstantBuffer.Get() };
+    ID3D11SamplerState* samplers[] = { m_linearClampSampler.Get() };
+
+    m_deviceContext->IASetInputLayout(nullptr);
+    m_deviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_deviceContext->RSSetState(m_rasterizerState.Get());
+    m_deviceContext->OMSetDepthStencilState(m_skyDepthStencilState.Get(), 0);
+    m_deviceContext->OMSetBlendState(nullptr, clearColor, 0xFFFFFFFFu);
+    m_deviceContext->VSSetShader(m_fullscreenVertexShader.Get(), nullptr, 0);
+    m_deviceContext->PSSetShader(m_bloomBlurPixelShader.Get(), nullptr, 0);
+    m_deviceContext->PSSetConstantBuffers(0, 1, postProcessBuffers);
+    m_deviceContext->PSSetSamplers(0, 1, samplers);
+    SetViewport(m_width, m_height);
+
+    auto renderBlurPass = [this, &clearColor, &inverseTextureSize](
+        ID3D11ShaderResourceView* sourceShaderResourceView,
+        ID3D11RenderTargetView* destinationRenderTargetView,
+        const XMFLOAT2& blurDirection)
+    {
+        PostProcessConstants postProcessConstants = {};
+        postProcessConstants.inverseTextureSize = inverseTextureSize;
+        postProcessConstants.blurDirection = blurDirection;
+        postProcessConstants.parameters = XMFLOAT4(2.0f, 0.0f, 0.0f, 0.0f);
+        UpdateConstantBuffer(m_deviceContext.Get(), m_postProcessConstantBuffer, postProcessConstants);
+
+        ID3D11RenderTargetView* renderTargets[] = { destinationRenderTargetView };
+        m_deviceContext->OMSetRenderTargets(1, renderTargets, nullptr);
+        m_deviceContext->ClearRenderTargetView(destinationRenderTargetView, clearColor);
+
+        ID3D11ShaderResourceView* shaderResources[] = { sourceShaderResourceView };
+        m_deviceContext->PSSetShaderResources(0, 1, shaderResources);
+        m_deviceContext->Draw(3, 0);
+
+        ID3D11ShaderResourceView* nullSrvs[] = { nullptr };
+        m_deviceContext->PSSetShaderResources(0, 1, nullSrvs);
+    };
+
+    ID3D11ShaderResourceView* currentSourceShaderResourceView = m_bloomSourceShaderResourceView.Get();
+    for (UINT blurPair = 0; blurPair < kBloomBlurPairCount; ++blurPair)
+    {
+        renderBlurPass(
+            currentSourceShaderResourceView,
+            m_bloomTextureBRenderTargetView.Get(),
+            XMFLOAT2(1.0f, 0.0f));
+        renderBlurPass(
+            m_bloomTextureBShaderResourceView.Get(),
+            m_bloomTextureARenderTargetView.Get(),
+            XMFLOAT2(0.0f, 1.0f));
+        currentSourceShaderResourceView = m_bloomTextureAShaderResourceView.Get();
+    }
+
+    m_deviceContext->OMSetRenderTargets(0, nullptr, nullptr);
+    EndEvent();
+}
+
+void Renderer::CompositeScene()
+{
+    if (m_renderTargetView == nullptr ||
+        m_hdrSceneShaderResourceView == nullptr ||
+        m_bloomSourceShaderResourceView == nullptr ||
+        m_bloomTextureAShaderResourceView == nullptr ||
+        m_bloomCompositePixelShader == nullptr ||
+        m_fullscreenVertexShader == nullptr ||
+        m_postProcessConstantBuffer == nullptr)
+    {
+        return;
+    }
+
+    BeginEvent(L"CompositePass");
+
+    PostProcessConstants postProcessConstants = {};
+    postProcessConstants.inverseTextureSize = XMFLOAT2(
+        (m_width > 0) ? (1.0f / static_cast<float>(m_width)) : 0.0f,
+        (m_height > 0) ? (1.0f / static_cast<float>(m_height)) : 0.0f);
+    postProcessConstants.parameters = XMFLOAT4(
+        m_bloomEnabled ? m_bloomIntensity : 0.0f,
+        1.2f,
+        0.0f,
+        0.0f);
+    UpdateConstantBuffer(m_deviceContext.Get(), m_postProcessConstantBuffer, postProcessConstants);
+
+    const float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    ID3D11RenderTargetView* renderTargets[] = { m_renderTargetView.Get() };
+    ID3D11Buffer* postProcessBuffers[] = { m_postProcessConstantBuffer.Get() };
+    ID3D11SamplerState* samplers[] = { m_linearClampSampler.Get() };
+    ID3D11ShaderResourceView* shaderResources[] =
+    {
+        m_hdrSceneShaderResourceView.Get(),
+        m_bloomTextureAShaderResourceView.Get(),
+        m_bloomSourceShaderResourceView.Get(),
+    };
+
+    m_deviceContext->IASetInputLayout(nullptr);
+    m_deviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_deviceContext->RSSetState(m_rasterizerState.Get());
+    m_deviceContext->OMSetDepthStencilState(m_skyDepthStencilState.Get(), 0);
+    m_deviceContext->OMSetBlendState(nullptr, clearColor, 0xFFFFFFFFu);
+    m_deviceContext->OMSetRenderTargets(1, renderTargets, nullptr);
+    m_deviceContext->VSSetShader(m_fullscreenVertexShader.Get(), nullptr, 0);
+    m_deviceContext->PSSetShader(m_bloomCompositePixelShader.Get(), nullptr, 0);
+    m_deviceContext->PSSetConstantBuffers(0, 1, postProcessBuffers);
+    m_deviceContext->PSSetSamplers(0, 1, samplers);
+    m_deviceContext->PSSetShaderResources(0, ARRAYSIZE(shaderResources), shaderResources);
+    m_deviceContext->ClearRenderTargetView(m_renderTargetView.Get(), clearColor);
+    SetViewport(m_width, m_height);
+    m_deviceContext->Draw(3, 0);
+
+    ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr, nullptr };
+    m_deviceContext->PSSetShaderResources(0, ARRAYSIZE(nullSrvs), nullSrvs);
+    m_deviceContext->OMSetRenderTargets(0, nullptr, nullptr);
 
     EndEvent();
 }
@@ -2688,16 +3001,24 @@ void Renderer::Render()
 
     BeginEvent(L"Frame");
 
-    ID3D11RenderTargetView* renderTargets[] = { m_renderTargetView.Get() };
-    m_deviceContext->OMSetRenderTargets(1, renderTargets, m_depthStencilView.Get());
+    ID3D11RenderTargetView* renderTargets[] =
+    {
+        m_hdrSceneRenderTargetView.Get(),
+        m_bloomSourceRenderTargetView.Get(),
+    };
+    m_deviceContext->OMSetRenderTargets(ARRAYSIZE(renderTargets), renderTargets, m_depthStencilView.Get());
     SetViewport(m_width, m_height);
 
     const float clearColor[4] = { 0.02f, 0.02f, 0.025f, 1.0f };
-    m_deviceContext->ClearRenderTargetView(m_renderTargetView.Get(), clearColor);
+    const float bloomClearColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    m_deviceContext->ClearRenderTargetView(m_hdrSceneRenderTargetView.Get(), clearColor);
+    m_deviceContext->ClearRenderTargetView(m_bloomSourceRenderTargetView.Get(), bloomClearColor);
     m_deviceContext->ClearDepthStencilView(m_depthStencilView.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
 
     RenderEnvironment();
     RenderModel();
+    ApplyBloom();
+    CompositeScene();
 
     const HRESULT hr = m_swapChain->Present(1, 0);
     if (FAILED(hr))
@@ -2748,12 +3069,15 @@ void Renderer::Cleanup()
     m_sphereGeometry = {};
     m_environmentSphereGeometry = {};
     m_captureConstantBuffer.Reset();
+    m_postProcessConstantBuffer.Reset();
     m_sceneFrameConstantBuffer.Reset();
     m_sceneObjectConstantBuffer.Reset();
     m_skyFrameConstantBuffer.Reset();
     m_sceneInputLayout.Reset();
     m_captureVertexShader.Reset();
     m_fullscreenVertexShader.Reset();
+    m_bloomBlurPixelShader.Reset();
+    m_bloomCompositePixelShader.Reset();
     m_brdfIntegrationPixelShader.Reset();
     m_equirectangularToCubemapPixelShader.Reset();
     m_irradianceConvolutionPixelShader.Reset();
@@ -2884,6 +3208,11 @@ LRESULT Renderer::HandleWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LP
         else if (wParam == 'L')
         {
             m_pointLightsEnabled = !m_pointLightsEnabled;
+            UpdateWindowTitle();
+        }
+        else if (wParam == 'B')
+        {
+            m_bloomEnabled = !m_bloomEnabled;
             UpdateWindowTitle();
         }
         return 0;

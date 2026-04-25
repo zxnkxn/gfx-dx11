@@ -1,6 +1,9 @@
 static const float kPi = 3.14159265f;
 static const float kDirectDiffuseBoost = 6.0f;
-static const float kDirectSpecularBoost = 0.0f;
+static const float kDirectSpecularBoost = 2.0f;
+static const float kEmissiveBloomBoost = 4.0f;
+static const float kHighlightBloomBoost = 2.0f;
+static const float kBloomInputExposure = 1.35f;
 
 struct PointLightData
 {
@@ -32,6 +35,12 @@ struct PSInput
     float3 worldPosition : TEXCOORD0;
     float3 normal : TEXCOORD1;
     float2 texCoord : TEXCOORD2;
+};
+
+struct PSOutput
+{
+    float4 sceneColor : SV_Target0;
+    float4 bloomMask : SV_Target1;
 };
 
 TextureCube<float4> irradianceMap : register(t0);
@@ -83,11 +92,6 @@ float3 FresnelSchlickRoughness(float cosTheta, float3 F0, float roughness)
     return F0 + (grazingF0 - F0) * pow(1.0f - clampedCosTheta, 5.0f);
 }
 
-float3 ToneMapReinhard(float3 color)
-{
-    return color / (1.0f.xxx + color);
-}
-
 float ComputePointLightAttenuation(float distanceToLight, float radius)
 {
     const float clampedRadius = max(radius, 0.001f);
@@ -96,13 +100,17 @@ float ComputePointLightAttenuation(float distanceToLight, float radius)
     return rangeFalloff * rangeFalloff;
 }
 
-float4 PS(PSInput input) : SV_Target
+float ComputeBrightness(float3 color)
 {
+    return max(color.r, max(color.g, color.b));
+}
+
+PSOutput PS(PSInput input)
+{
+    PSOutput output = (PSOutput)0;
+
     const float3 V = normalize(cameraPosition.xyz - input.worldPosition);
     const float3 geometricNormal = normalize(input.normal);
-    // Keep the shading normal oriented towards the camera. This makes the
-    // direct-light branch robust even if the visible sphere faces end up using
-    // the opposite winding/normal orientation.
     const float3 N = (dot(geometricNormal, V) >= 0.0f) ? geometricNormal : -geometricNormal;
     const int displayMode = (int)globalParameters.x;
     const int alphaMode = (int)materialFlags.x;
@@ -127,17 +135,8 @@ float4 PS(PSInput input) : SV_Target
     const float3 dielectricF0 = float3(0.04f, 0.04f, 0.04f);
     const float3 F0 = lerp(dielectricF0, albedoColor, clampedMetalness);
 
-    if (any(emissiveColorLinear > 0.0f))
-    {
-        const float3 emissiveColor = ToneMapReinhard(emissiveColorLinear);
-        const float3 gammaCorrectedEmissive = pow(clamp(emissiveColor, 0.0f.xxx, 1.0f.xxx), 1.0f / 2.2f);
-        return float4(gammaCorrectedEmissive, (alphaMode == 2) ? alpha : 1.0f);
-    }
-
     if (displayMode != 0 && displayMode != 4)
     {
-        // Use a stable analytic preview for the BRDF terms so the debug modes
-        // stay readable and are not tied to the scene lighting composition.
         const float3 debugNormal = (dot(N, V) >= 0.0f) ? N : -N;
         const float3 debugViewDirection = normalize(V);
         const float3 referenceUp = (abs(debugViewDirection.y) < 0.95f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
@@ -168,25 +167,22 @@ float4 PS(PSInput input) : SV_Target
         {
             const float distributionValue =
                 pow(clamp(log2(1.0f + debugDistribution * 96.0f) / 7.0f, 0.0f, 1.0f), 0.42f);
-            const float3 debugColor = pow(lerp(0.08f.xxx, 1.0f.xxx, distributionValue), 1.0f / 2.2f);
-            return float4(debugColor, (alphaMode == 2) ? alpha : 1.0f);
+            output.sceneColor = float4(lerp(0.08f.xxx, 1.0f.xxx, distributionValue), (alphaMode == 2) ? alpha : 1.0f);
+            return output;
         }
 
         if (displayMode == 2)
         {
             const float geometryValue = pow(clamp(debugGeometry, 0.0f, 1.0f), 0.55f);
-            const float3 debugColor = pow(lerp(0.08f.xxx, 1.0f.xxx, geometryValue), 1.0f / 2.2f);
-            return float4(debugColor, (alphaMode == 2) ? alpha : 1.0f);
+            output.sceneColor = float4(lerp(0.08f.xxx, 1.0f.xxx, geometryValue), (alphaMode == 2) ? alpha : 1.0f);
+            return output;
         }
 
-        const float3 debugColor = pow(clamp(debugFresnel, 0.0f.xxx, 1.0f.xxx), 1.0f / 2.2f);
-        return float4(debugColor, (alphaMode == 2) ? alpha : 1.0f);
+        output.sceneColor = float4(clamp(debugFresnel, 0.0f.xxx, 1.0f.xxx), (alphaMode == 2) ? alpha : 1.0f);
+        return output;
     }
 
     float3 radianceSum = 0.0f.xxx;
-    float accumulatedDistribution = 0.0f;
-    float accumulatedGeometry = 0.0f;
-    float3 accumulatedFresnel = 0.0f.xxx;
 
     [unroll]
     for (int lightIndex = 0; lightIndex < 3; ++lightIndex)
@@ -198,8 +194,6 @@ float4 PS(PSInput input) : SV_Target
 
         const float NdotL = clamp(dot(N, L), 0.0f, 1.0f);
         const float NdotV = clamp(dot(N, V), 0.0f, 1.0f);
-
-        // Point lights must not affect the surface from the opposite side.
         if (NdotL <= 0.0f || NdotV <= 0.0f)
         {
             continue;
@@ -208,14 +202,10 @@ float4 PS(PSInput input) : SV_Target
         const float NdotH = clamp(dot(N, H), 0.0f, 1.0f);
         const float HdotV = clamp(dot(H, V), 0.0f, 1.0f);
 
-        const float directLightRoughness = 1.0f;
+        const float directLightRoughness = clampedRoughness;
         const float D = DistributionGGX(NdotH, directLightRoughness);
         const float G = GeometrySmith(NdotV, NdotL, directLightRoughness);
         const float3 F = FresnelSchlick(HdotV, F0);
-
-        accumulatedDistribution = max(accumulatedDistribution, D);
-        accumulatedGeometry = max(accumulatedGeometry, G);
-        accumulatedFresnel = max(accumulatedFresnel, F);
 
         const float3 numerator = D * G * F;
         const float denominator = max(4.0f * NdotV * NdotL, 1.0e-4f);
@@ -259,9 +249,25 @@ float4 PS(PSInput input) : SV_Target
     const float3 ambientSpecular = prefilteredColor * (Fambient * brdf.x + brdf.y);
     const float3 ambient = (kDambient * ambientDiffuse + ambientSpecular) * max(globalParameters.y, 0.0f);
 
-    const float exposure = 1.2f;
-    const float3 finalColor = ((displayMode == 4) ? radianceSum : (ambient + radianceSum)) * ambientOcclusion;
-    const float3 toneMappedColor = ToneMapReinhard(max(finalColor * exposure, 0.0f.xxx));
-    const float3 gammaCorrectedColor = pow(clamp(toneMappedColor, 0.0f.xxx, 1.0f.xxx), 1.0f / 2.2f);
-    return float4(gammaCorrectedColor, (alphaMode == 2) ? alpha : 1.0f);
+    const float3 litColor = ((displayMode == 4) ? radianceSum : (ambient + radianceSum)) * ambientOcclusion;
+    const float3 finalColor = max(litColor + emissiveColorLinear, 0.0f.xxx);
+
+    float3 bloomColor = 0.0f.xxx;
+    if (displayMode == 0)
+    {
+        bloomColor = emissiveColorLinear * kEmissiveBloomBoost;
+
+        const float bloomThreshold = max(globalParameters.w, 0.001f);
+        const float softKnee = max(bloomThreshold * 0.5f, 0.05f);
+        const float3 bloomInput = finalColor * kBloomInputExposure;
+        const float sceneBrightness = ComputeBrightness(bloomInput);
+        const float brightContribution =
+            smoothstep(bloomThreshold - softKnee, bloomThreshold + softKnee, sceneBrightness);
+        const float3 highlightBloom = max(bloomInput - bloomThreshold.xxx, 0.0f.xxx);
+        bloomColor += highlightBloom * brightContribution * kHighlightBloomBoost;
+    }
+
+    output.sceneColor = float4(finalColor, (alphaMode == 2) ? alpha : 1.0f);
+    output.bloomMask = float4(max(bloomColor, 0.0f.xxx), 1.0f);
+    return output;
 }
