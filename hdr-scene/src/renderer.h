@@ -33,18 +33,20 @@ public:
     void Cleanup();
 
 private:
+    static constexpr UINT kShadowCascadeCount = 4;
+
     enum class MeshKind
     {
         Cube,
         Plane,
     };
 
-    struct PointLight
+    struct DirectionalLight
     {
-        DirectX::XMFLOAT3 position;
-        float radius;
-        DirectX::XMFLOAT3 color;
+        DirectX::XMFLOAT3 direction;
         float intensity;
+        DirectX::XMFLOAT3 color;
+        float ambientIntensity;
     };
 
     struct SceneObject
@@ -52,7 +54,7 @@ private:
         MeshKind meshKind;
         DirectX::XMFLOAT4X4 world;
         DirectX::XMFLOAT3 albedo;
-        float padding;
+        float shadowReceiver = 1.0f;
     };
 
     struct MeshGeometry
@@ -71,18 +73,16 @@ private:
         UINT height = 0;
     };
 
-    struct PointLightGpu
-    {
-        DirectX::XMFLOAT4 positionRadius;
-        DirectX::XMFLOAT4 colorIntensity;
-    };
-
     struct SceneFrameConstants
     {
         DirectX::XMFLOAT4X4 viewProjection;
         DirectX::XMFLOAT4 cameraPosition;
-        PointLightGpu pointLights[3];
-        DirectX::XMFLOAT4 globalParameters;
+        DirectX::XMFLOAT4 cameraForward;
+        DirectX::XMFLOAT4 lightDirectionIntensity;
+        DirectX::XMFLOAT4 lightColorAmbient;
+        DirectX::XMFLOAT4 cascadeSplits;
+        DirectX::XMFLOAT4 shadowTexelData;
+        DirectX::XMFLOAT4X4 shadowMatrices[kShadowCascadeCount];
     };
 
     struct SceneObjectConstants
@@ -90,6 +90,11 @@ private:
         DirectX::XMFLOAT4X4 world;
         DirectX::XMFLOAT4X4 normalMatrix;
         DirectX::XMFLOAT4 albedo;
+    };
+
+    struct ShadowFrameConstants
+    {
+        DirectX::XMFLOAT4X4 viewProjection;
     };
 
     struct DownsampleConstants
@@ -114,6 +119,13 @@ private:
         float padding;
     };
 
+    struct ShadowCascade
+    {
+        DirectX::XMFLOAT4X4 viewProjection = {};
+        DirectX::XMFLOAT4X4 worldToShadowTexture = {};
+        float splitDistance = 0.0f;
+    };
+
 private:
     // Window and application setup
     HRESULT RegisterWindowClass(HINSTANCE hInstance);
@@ -126,8 +138,10 @@ private:
     HRESULT CreateConstantBuffers();
     HRESULT CreateShaders();
     HRESULT CreateGeometry();
+    HRESULT CreateShadowResources();
     void CreateSceneObjects();
-    void InitializeLights();
+    void InitializeLighting();
+    void UpdateSceneBounds();
     void UpdateWindowTitle();
 
     // Window-size dependent resources
@@ -142,8 +156,11 @@ private:
     // Rendering
     void Update(float deltaTime);
     void UpdateCamera();
+    void UpdateShadowCascades();
+    void RenderShadowMaps();
     void RenderSceneToHdr();
     void DrawSceneObject(const SceneObject& object);
+    void DrawSceneObjectShadow(const SceneObject& object);
     void ComputeAverageLuminance();
     void AdaptEye(float deltaTime);
     void ToneMapToBackBuffer();
@@ -186,13 +203,16 @@ private:
     float m_cameraYaw;
     float m_cameraPitch;
     DirectX::XMFLOAT3 m_cameraPosition;
+    DirectX::XMFLOAT3 m_cameraForward;
     DirectX::XMFLOAT4X4 m_viewMatrix;
     DirectX::XMFLOAT4X4 m_projectionMatrix;
 
     // Scene state
     std::vector<SceneObject> m_sceneObjects;
-    std::array<PointLight, 3> m_pointLights;
-    int m_lightIntensityIndex;
+    DirectionalLight m_directionalLight;
+    DirectX::XMFLOAT3 m_sceneBoundsMin;
+    DirectX::XMFLOAT3 m_sceneBoundsMax;
+    std::array<ShadowCascade, kShadowCascadeCount> m_shadowCascades;
 
     // DirectX core objects
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
@@ -202,6 +222,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_depthStencilBuffer;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilView> m_depthStencilView;
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> m_rasterizerState;
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> m_shadowRasterizerState;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> m_depthStencilState;
     Microsoft::WRL::ComPtr<ID3DUserDefinedAnnotation> m_annotation;
 
@@ -212,6 +233,7 @@ private:
     // Scene pipeline
     Microsoft::WRL::ComPtr<ID3D11VertexShader> m_sceneVertexShader;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_scenePixelShader;
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> m_shadowVertexShader;
     Microsoft::WRL::ComPtr<ID3D11InputLayout> m_sceneInputLayout;
 
     // Post-processing pipeline
@@ -222,13 +244,20 @@ private:
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_toneMappingPixelShader;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> m_pointClampSampler;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> m_linearClampSampler;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> m_shadowComparisonSampler;
 
     // Constant buffers
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_sceneFrameConstantBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_sceneObjectConstantBuffer;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_shadowFrameConstantBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_downsampleConstantBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_adaptationConstantBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_toneMappingConstantBuffer;
+
+    // Shadow resources
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_shadowMapTexture;
+    std::array<Microsoft::WRL::ComPtr<ID3D11DepthStencilView>, kShadowCascadeCount> m_shadowCascadeDepthStencilViews;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_shadowMapShaderResourceView;
 
     // HDR render targets
     RenderTexture m_hdrSceneTexture;
