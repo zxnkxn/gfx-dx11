@@ -40,10 +40,16 @@
     <FxCompile Include="src\shaders\luminance_reduce_pixel_shader.hlsl">
       <Filter>Shader Files</Filter>
     </FxCompile>
+    <FxCompile Include="src\shaders\normal_prepass_pixel_shader.hlsl">
+      <Filter>Shader Files</Filter>
+    </FxCompile>
     <FxCompile Include="src\shaders\scene_pixel_shader.hlsl">
       <Filter>Shader Files</Filter>
     </FxCompile>
     <FxCompile Include="src\shaders\scene_vertex_shader.hlsl">
+      <Filter>Shader Files</Filter>
+    </FxCompile>
+    <FxCompile Include="src\shaders\ssao_pixel_shader.hlsl">
       <Filter>Shader Files</Filter>
     </FxCompile>
     <FxCompile Include="src\shaders\shadow_vertex_shader.hlsl">

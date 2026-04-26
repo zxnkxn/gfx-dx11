@@ -7,6 +7,7 @@ cbuffer SceneFrameConstants : register(b0)
     float4 lightColorAmbient;
     float4 cascadeSplits;
     float4 shadowTexelData;
+    float4 ambientOcclusionData;
     row_major float4x4 shadowMatrices[4];
 };
 

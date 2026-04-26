@@ -34,6 +34,8 @@ public:
 
 private:
     static constexpr UINT kShadowCascadeCount = 4;
+    static constexpr UINT kSsaoSampleCount = 32;
+    static constexpr UINT kSsaoNoiseDimension = 4;
 
     enum class MeshKind
     {
@@ -82,6 +84,7 @@ private:
         DirectX::XMFLOAT4 lightColorAmbient;
         DirectX::XMFLOAT4 cascadeSplits;
         DirectX::XMFLOAT4 shadowTexelData;
+        DirectX::XMFLOAT4 ambientOcclusionData;
         DirectX::XMFLOAT4X4 shadowMatrices[kShadowCascadeCount];
     };
 
@@ -95,6 +98,21 @@ private:
     struct ShadowFrameConstants
     {
         DirectX::XMFLOAT4X4 viewProjection;
+    };
+
+    struct NormalPrepassConstants
+    {
+        DirectX::XMFLOAT4X4 viewMatrix;
+    };
+
+    struct SsaoConstants
+    {
+        DirectX::XMFLOAT4X4 projection;
+        DirectX::XMFLOAT4X4 inverseProjection;
+        DirectX::XMFLOAT4 ssaoParameters;
+        DirectX::XMFLOAT4 inverseTextureSize;
+        DirectX::XMFLOAT4 samples[kSsaoSampleCount];
+        DirectX::XMFLOAT4 noise[kSsaoNoiseDimension * kSsaoNoiseDimension];
     };
 
     struct DownsampleConstants
@@ -149,15 +167,20 @@ private:
     HRESULT CreateRenderTargetView();
     HRESULT CreateDepthStencilBuffer();
     HRESULT CreateHdrSceneBuffer();
+    HRESULT CreateNormalBuffer();
+    HRESULT CreateAmbientOcclusionBuffer();
     HRESULT CreateLuminanceResources();
     void ReleaseWindowSizeResources();
     void ResizeSwapChain(UINT width, UINT height);
 
     // Rendering
+    void InitializeSsaoKernel();
     void Update(float deltaTime);
     void UpdateCamera();
     void UpdateShadowCascades();
     void RenderShadowMaps();
+    void RenderNormalDepthPrepass();
+    void RenderAmbientOcclusion();
     void RenderSceneToHdr();
     void DrawSceneObject(const SceneObject& object);
     void DrawSceneObjectShadow(const SceneObject& object);
@@ -213,6 +236,10 @@ private:
     DirectX::XMFLOAT3 m_sceneBoundsMin;
     DirectX::XMFLOAT3 m_sceneBoundsMax;
     std::array<ShadowCascade, kShadowCascadeCount> m_shadowCascades;
+    bool m_ssaoEnabled;
+    bool m_ssaoPreviewEnabled;
+    std::array<DirectX::XMFLOAT4, kSsaoSampleCount> m_ssaoSamples;
+    std::array<DirectX::XMFLOAT4, kSsaoNoiseDimension * kSsaoNoiseDimension> m_ssaoNoise;
 
     // DirectX core objects
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
@@ -221,6 +248,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_renderTargetView;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_depthStencilBuffer;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilView> m_depthStencilView;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_depthStencilShaderResourceView;
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> m_rasterizerState;
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> m_shadowRasterizerState;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> m_depthStencilState;
@@ -238,6 +266,8 @@ private:
 
     // Post-processing pipeline
     Microsoft::WRL::ComPtr<ID3D11VertexShader> m_fullscreenVertexShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_normalPrepassPixelShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_ssaoPixelShader;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_luminanceInitialPixelShader;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_luminanceReducePixelShader;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_luminanceAdaptPixelShader;
@@ -250,6 +280,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_sceneFrameConstantBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_sceneObjectConstantBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_shadowFrameConstantBuffer;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_normalPrepassConstantBuffer;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_ssaoConstantBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_downsampleConstantBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_adaptationConstantBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_toneMappingConstantBuffer;
@@ -261,6 +293,8 @@ private:
 
     // HDR render targets
     RenderTexture m_hdrSceneTexture;
+    RenderTexture m_normalTexture;
+    RenderTexture m_ssaoTexture;
     std::vector<RenderTexture> m_luminanceChain;
     std::array<RenderTexture, 2> m_adaptedLuminanceTextures;
     UINT m_currentAdaptedLuminanceIndex;

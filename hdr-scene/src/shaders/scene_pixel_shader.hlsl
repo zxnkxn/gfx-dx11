@@ -7,6 +7,7 @@ cbuffer SceneFrameConstants : register(b0)
     float4 lightColorAmbient;
     float4 cascadeSplits;
     float4 shadowTexelData;
+    float4 ambientOcclusionData;
     row_major float4x4 shadowMatrices[4];
 };
 
@@ -27,7 +28,9 @@ struct PSInput
 };
 
 Texture2DArray<float> shadowMapTexture : register(t0);
+Texture2D<float> ambientOcclusionTexture : register(t1);
 SamplerComparisonState shadowSampler : register(s0);
+SamplerState pointClampSampler : register(s1);
 
 float SampleShadowCascade(int cascadeIndex, float3 worldPosition, float3 worldNormal)
 {
@@ -95,6 +98,12 @@ float4 PS(PSInput input) : SV_Target
     const float3 viewDirection = normalize(cameraPosition.xyz - input.worldPosition);
     const float3 lightDirection = normalize(-lightDirectionIntensity.xyz);
     const float3 lightColor = lightColorAmbient.rgb * lightDirectionIntensity.w;
+    const float2 ambientOcclusionUv = saturate(input.position.xy * ambientOcclusionData.xy);
+    const float ambientOcclusion = ambientOcclusionTexture.SampleLevel(pointClampSampler, ambientOcclusionUv, 0.0f);
+    if (ambientOcclusionData.w > 0.5f)
+    {
+        return float4(ambientOcclusion.xxx, 1.0f);
+    }
 
     const float shadowVisibility =
         (albedo.a > 0.5f && dot(normal, lightDirection) > 0.0f)
@@ -104,10 +113,12 @@ float4 PS(PSInput input) : SV_Target
     const float diffuseTerm = saturate(dot(normal, lightDirection));
     const float3 halfVector = normalize(lightDirection + viewDirection);
     const float specularTerm = pow(saturate(dot(normal, halfVector)), 72.0f) * shadowVisibility;
+    const float directLightingOcclusion = lerp(1.0f, ambientOcclusion, ambientOcclusionData.z);
+    const float specularOcclusion = lerp(1.0f, ambientOcclusion, ambientOcclusionData.z * 0.35f);
 
-    const float3 ambient = input.albedo * lightColorAmbient.w;
-    const float3 diffuse = input.albedo * lightColor * diffuseTerm * shadowVisibility;
-    const float3 specular = lightColor * specularTerm * 0.18f;
+    const float3 ambient = input.albedo * lightColorAmbient.w * ambientOcclusion;
+    const float3 diffuse = input.albedo * lightColor * diffuseTerm * shadowVisibility * directLightingOcclusion;
+    const float3 specular = lightColor * specularTerm * 0.18f * specularOcclusion;
 
     return float4(ambient + diffuse + specular, 1.0f);
 }

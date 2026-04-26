@@ -8,6 +8,7 @@
 #include <cfloat>
 #include <cmath>
 #include <filesystem>
+#include <random>
 #include <string_view>
 #include <system_error>
 
@@ -37,10 +38,20 @@ namespace
     constexpr float kCascadeSplitLambda = 0.65f;
     constexpr float kCascadePaddingScale = 1.10f;
     constexpr float kShadowDepthMargin = 16.0f;
+    constexpr float kSsaoRadius = 1.45f;
+    constexpr float kSsaoBias = 0.02f;
+    constexpr float kSsaoStrength = 2.35f;
+    constexpr float kSsaoMaxDepthDifference = 2.5f;
+    constexpr float kSsaoDirectLightingInfluence = 0.32f;
 
     constexpr XMFLOAT3 kSunDirection = XMFLOAT3(-0.55f, -1.0f, 0.35f);
     constexpr XMFLOAT3 kSunColor = XMFLOAT3(1.0f, 0.97f, 0.92f);
     constexpr float kSunIntensity = 5.25f;
+
+    float Lerp(float from, float to, float t)
+    {
+        return from + (to - from) * t;
+    }
 
     float Dot3(const XMVECTOR& left, const XMVECTOR& right)
     {
@@ -236,11 +247,16 @@ Renderer::Renderer() :
     m_directionalLight{ kSunDirection, kSunIntensity, kSunColor, kAmbientStrength },
     m_sceneBoundsMin(-1.0f, 0.0f, -1.0f),
     m_sceneBoundsMax(1.0f, 1.0f, 1.0f),
+    m_ssaoEnabled(true),
+    m_ssaoPreviewEnabled(false),
+    m_ssaoSamples{},
+    m_ssaoNoise{},
     m_currentAdaptedLuminanceIndex(0),
     m_debugLayerEnabled(false)
 {
     XMStoreFloat4x4(&m_viewMatrix, XMMatrixIdentity());
     XMStoreFloat4x4(&m_projectionMatrix, XMMatrixIdentity());
+    InitializeSsaoKernel();
     UpdateCamera();
 }
 
@@ -547,6 +563,18 @@ HRESULT Renderer::CreateWindowSizeResources()
         return hr;
     }
 
+    hr = CreateNormalBuffer();
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = CreateAmbientOcclusionBuffer();
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
     hr = CreateLuminanceResources();
     if (FAILED(hr))
     {
@@ -584,9 +612,9 @@ HRESULT Renderer::CreateDepthStencilBuffer()
     textureDesc.Height = m_height;
     textureDesc.MipLevels = 1;
     textureDesc.ArraySize = 1;
-    textureDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    textureDesc.Format = DXGI_FORMAT_R24G8_TYPELESS;
     textureDesc.SampleDesc.Count = 1;
-    textureDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    textureDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
 
     HRESULT hr = m_device->CreateTexture2D(&textureDesc, nullptr, m_depthStencilBuffer.ReleaseAndGetAddressOf());
     if (FAILED(hr))
@@ -595,7 +623,7 @@ HRESULT Renderer::CreateDepthStencilBuffer()
     }
 
     D3D11_DEPTH_STENCIL_VIEW_DESC viewDesc = {};
-    viewDesc.Format = textureDesc.Format;
+    viewDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     viewDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
     viewDesc.Texture2D.MipSlice = 0;
 
@@ -608,8 +636,23 @@ HRESULT Renderer::CreateDepthStencilBuffer()
         return hr;
     }
 
+    D3D11_SHADER_RESOURCE_VIEW_DESC shaderResourceViewDesc = {};
+    shaderResourceViewDesc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    shaderResourceViewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    shaderResourceViewDesc.Texture2D.MipLevels = 1;
+
+    hr = m_device->CreateShaderResourceView(
+        m_depthStencilBuffer.Get(),
+        &shaderResourceViewDesc,
+        m_depthStencilShaderResourceView.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
     SetDebugName(m_depthStencilBuffer.Get(), "HDRSceneDepthBuffer");
     SetDebugName(m_depthStencilView.Get(), "HDRSceneDepthBufferDSV");
+    SetDebugName(m_depthStencilShaderResourceView.Get(), "HDRSceneDepthBufferSRV");
     return S_OK;
 }
 
@@ -621,6 +664,26 @@ HRESULT Renderer::CreateHdrSceneBuffer()
         DXGI_FORMAT_R16G16B16A16_FLOAT,
         m_hdrSceneTexture,
         "HDRSceneColor");
+}
+
+HRESULT Renderer::CreateNormalBuffer()
+{
+    return CreateRenderTexture(
+        m_width,
+        m_height,
+        DXGI_FORMAT_R16G16B16A16_FLOAT,
+        m_normalTexture,
+        "HDRSceneNormals");
+}
+
+HRESULT Renderer::CreateAmbientOcclusionBuffer()
+{
+    return CreateRenderTexture(
+        m_width,
+        m_height,
+        DXGI_FORMAT_R8_UNORM,
+        m_ssaoTexture,
+        "HDRSceneSSAO");
 }
 
 HRESULT Renderer::CreateLuminanceResources()
@@ -685,9 +748,12 @@ HRESULT Renderer::CreateLuminanceResources()
 void Renderer::ReleaseWindowSizeResources()
 {
     m_renderTargetView.Reset();
+    m_depthStencilShaderResourceView.Reset();
     m_depthStencilView.Reset();
     m_depthStencilBuffer.Reset();
     m_hdrSceneTexture = {};
+    m_normalTexture = {};
+    m_ssaoTexture = {};
     m_luminanceChain.clear();
     m_adaptedLuminanceTextures = {};
 }
@@ -797,6 +863,18 @@ HRESULT Renderer::CreateConstantBuffers()
     }
 
     hr = CreateConstantBuffer<ShadowFrameConstants>(m_device.Get(), m_shadowFrameConstantBuffer, "ShadowFrameCB");
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = CreateConstantBuffer<NormalPrepassConstants>(m_device.Get(), m_normalPrepassConstantBuffer, "NormalPrepassCB");
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = CreateConstantBuffer<SsaoConstants>(m_device.Get(), m_ssaoConstantBuffer, "SsaoCB");
     if (FAILED(hr))
     {
         return hr;
@@ -960,6 +1038,26 @@ HRESULT Renderer::CreateShaders()
         L"src\\shaders\\fullscreen_vertex_shader.hlsl",
         m_fullscreenVertexShader,
         "FullscreenVertexShader");
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = createPixelShader(
+        L"normal_prepass_pixel_shader.cso",
+        L"src\\shaders\\normal_prepass_pixel_shader.hlsl",
+        m_normalPrepassPixelShader,
+        "NormalPrepassPixelShader");
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = createPixelShader(
+        L"ssao_pixel_shader.cso",
+        L"src\\shaders\\ssao_pixel_shader.hlsl",
+        m_ssaoPixelShader,
+        "SsaoPixelShader");
     if (FAILED(hr))
     {
         return hr;
@@ -1207,6 +1305,46 @@ void Renderer::InitializeLighting()
     m_directionalLight.ambientIntensity = kAmbientStrength;
 }
 
+void Renderer::InitializeSsaoKernel()
+{
+    std::mt19937 randomEngine(1337u);
+    std::uniform_real_distribution<float> randomSigned(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> randomUnsigned(0.0f, 1.0f);
+
+    for (UINT sampleIndex = 0; sampleIndex < kSsaoSampleCount; ++sampleIndex)
+    {
+        XMVECTOR sample = XMVectorSet(
+            randomSigned(randomEngine),
+            randomSigned(randomEngine),
+            randomUnsigned(randomEngine),
+            0.0f);
+
+        sample = XMVector3Normalize(sample);
+        sample = XMVectorScale(sample, randomUnsigned(randomEngine));
+
+        const float scale = static_cast<float>(sampleIndex) / static_cast<float>(kSsaoSampleCount);
+        sample = XMVectorScale(sample, Lerp(0.1f, 1.0f, scale * scale));
+
+        XMFLOAT4 sampleValue = {};
+        XMStoreFloat4(&sampleValue, sample);
+        sampleValue.w = 0.0f;
+        m_ssaoSamples[sampleIndex] = sampleValue;
+    }
+
+    for (XMFLOAT4& noiseValue : m_ssaoNoise)
+    {
+        XMVECTOR noise = XMVectorSet(randomSigned(randomEngine), randomSigned(randomEngine), 0.0f, 0.0f);
+        if (XMVectorGetX(XMVector3LengthSq(noise)) < 1.0e-6f)
+        {
+            noise = XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
+        }
+
+        noise = XMVector3Normalize(noise);
+        XMStoreFloat4(&noiseValue, noise);
+        noiseValue.w = 0.0f;
+    }
+}
+
 void Renderer::UpdateSceneBounds()
 {
     XMVECTOR boundsMin = XMVectorReplicate(FLT_MAX);
@@ -1251,7 +1389,11 @@ void Renderer::UpdateWindowTitle()
 
     const std::wstring title =
         m_title +
-        L" | LMB orbit | Wheel zoom | WASD / Arrows move target | Stable CSM shadows";
+        L" | LMB orbit | Wheel zoom | WASD / Arrows move target | O SSAO: " +
+        std::wstring(m_ssaoEnabled ? L"On" : L"Off") +
+        L" | P AO view: " +
+        std::wstring(m_ssaoPreviewEnabled ? L"On" : L"Off") +
+        L" | Stable CSM shadows";
 
     SetWindowTextW(m_hwnd, title.c_str());
 }
@@ -1527,6 +1669,109 @@ void Renderer::RenderShadowMaps()
     EndEvent();
 }
 
+void Renderer::RenderNormalDepthPrepass()
+{
+    BeginEvent(L"NormalPrepass");
+
+    ID3D11RenderTargetView* renderTargets[] = { m_normalTexture.renderTargetView.Get() };
+    m_deviceContext->OMSetRenderTargets(1, renderTargets, m_depthStencilView.Get());
+    m_deviceContext->RSSetState(m_rasterizerState.Get());
+    m_deviceContext->OMSetDepthStencilState(m_depthStencilState.Get(), 0);
+    SetViewport(m_normalTexture.width, m_normalTexture.height);
+
+    const float clearNormal[4] = { 0.5f, 0.5f, 1.0f, 1.0f };
+    m_deviceContext->ClearRenderTargetView(m_normalTexture.renderTargetView.Get(), clearNormal);
+    m_deviceContext->ClearDepthStencilView(m_depthStencilView.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+
+    m_deviceContext->IASetInputLayout(m_sceneInputLayout.Get());
+    m_deviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_deviceContext->VSSetShader(m_sceneVertexShader.Get(), nullptr, 0);
+    m_deviceContext->PSSetShader(m_normalPrepassPixelShader.Get(), nullptr, 0);
+
+    const XMMATRIX viewProjection = XMLoadFloat4x4(&m_viewMatrix) * XMLoadFloat4x4(&m_projectionMatrix);
+
+    SceneFrameConstants sceneFrameConstants = {};
+    sceneFrameConstants.viewProjection = StoreMatrix(viewProjection);
+    sceneFrameConstants.cameraPosition = XMFLOAT4(m_cameraPosition.x, m_cameraPosition.y, m_cameraPosition.z, 1.0f);
+    sceneFrameConstants.cameraForward = XMFLOAT4(m_cameraForward.x, m_cameraForward.y, m_cameraForward.z, 0.0f);
+    sceneFrameConstants.ambientOcclusionData =
+        XMFLOAT4(1.0f / static_cast<float>(m_width), 1.0f / static_cast<float>(m_height), 0.0f, 0.0f);
+    UpdateConstantBuffer(m_deviceContext.Get(), m_sceneFrameConstantBuffer, sceneFrameConstants);
+
+    NormalPrepassConstants normalPrepassConstants = {};
+    normalPrepassConstants.viewMatrix = m_viewMatrix;
+    UpdateConstantBuffer(m_deviceContext.Get(), m_normalPrepassConstantBuffer, normalPrepassConstants);
+
+    ID3D11Buffer* sceneFrameBuffers[] = { m_sceneFrameConstantBuffer.Get() };
+    ID3D11Buffer* normalFrameBuffers[] = { m_normalPrepassConstantBuffer.Get() };
+    ID3D11Buffer* objectBuffers[] = { m_sceneObjectConstantBuffer.Get() };
+    m_deviceContext->VSSetConstantBuffers(0, 1, sceneFrameBuffers);
+    m_deviceContext->VSSetConstantBuffers(1, 1, objectBuffers);
+    m_deviceContext->PSSetConstantBuffers(0, 1, normalFrameBuffers);
+
+    for (const SceneObject& object : m_sceneObjects)
+    {
+        DrawSceneObject(object);
+    }
+
+    EndEvent();
+}
+
+void Renderer::RenderAmbientOcclusion()
+{
+    BeginEvent(L"AmbientOcclusion");
+
+    ID3D11RenderTargetView* renderTargets[] = { m_ssaoTexture.renderTargetView.Get() };
+    m_deviceContext->OMSetRenderTargets(1, renderTargets, nullptr);
+    SetViewport(m_ssaoTexture.width, m_ssaoTexture.height);
+
+    const float clearValue[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    m_deviceContext->ClearRenderTargetView(m_ssaoTexture.renderTargetView.Get(), clearValue);
+
+    if (!m_ssaoEnabled)
+    {
+        EndEvent();
+        return;
+    }
+
+    const XMMATRIX projectionMatrix = XMLoadFloat4x4(&m_projectionMatrix);
+    const XMMATRIX inverseProjectionMatrix = XMMatrixInverse(nullptr, projectionMatrix);
+
+    SsaoConstants ssaoConstants = {};
+    ssaoConstants.projection = StoreMatrix(projectionMatrix);
+    ssaoConstants.inverseProjection = StoreMatrix(inverseProjectionMatrix);
+    ssaoConstants.ssaoParameters = XMFLOAT4(kSsaoRadius, kSsaoBias, kSsaoStrength, kSsaoMaxDepthDifference);
+    ssaoConstants.inverseTextureSize =
+        XMFLOAT4(1.0f / static_cast<float>(m_width), 1.0f / static_cast<float>(m_height), 0.0f, 0.0f);
+    std::copy(m_ssaoSamples.begin(), m_ssaoSamples.end(), std::begin(ssaoConstants.samples));
+    std::copy(m_ssaoNoise.begin(), m_ssaoNoise.end(), std::begin(ssaoConstants.noise));
+    UpdateConstantBuffer(m_deviceContext.Get(), m_ssaoConstantBuffer, ssaoConstants);
+
+    ID3D11Buffer* ssaoBuffers[] = { m_ssaoConstantBuffer.Get() };
+    ID3D11SamplerState* samplers[] = { m_pointClampSampler.Get() };
+    ID3D11ShaderResourceView* shaderResources[] =
+    {
+        m_depthStencilShaderResourceView.Get(),
+        m_normalTexture.shaderResourceView.Get(),
+    };
+
+    m_deviceContext->IASetInputLayout(nullptr);
+    m_deviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_deviceContext->RSSetState(m_rasterizerState.Get());
+    m_deviceContext->OMSetDepthStencilState(nullptr, 0);
+    m_deviceContext->VSSetShader(m_fullscreenVertexShader.Get(), nullptr, 0);
+    m_deviceContext->PSSetShader(m_ssaoPixelShader.Get(), nullptr, 0);
+    m_deviceContext->PSSetConstantBuffers(0, 1, ssaoBuffers);
+    m_deviceContext->PSSetSamplers(0, 1, samplers);
+    m_deviceContext->PSSetShaderResources(0, ARRAYSIZE(shaderResources), shaderResources);
+    m_deviceContext->Draw(3, 0);
+
+    ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr };
+    m_deviceContext->PSSetShaderResources(0, ARRAYSIZE(nullSrvs), nullSrvs);
+
+    EndEvent();
+}
+
 void Renderer::RenderSceneToHdr()
 {
     BeginEvent(L"ScenePass");
@@ -1575,6 +1820,12 @@ void Renderer::RenderSceneToHdr()
         0.0040f,
         0.0f,
         0.0f);
+    frameConstants.ambientOcclusionData =
+        XMFLOAT4(
+            1.0f / static_cast<float>(m_width),
+            1.0f / static_cast<float>(m_height),
+            kSsaoDirectLightingInfluence,
+            m_ssaoPreviewEnabled ? 1.0f : 0.0f);
     for (UINT cascadeIndex = 0; cascadeIndex < kShadowCascadeCount; ++cascadeIndex)
     {
         frameConstants.shadowMatrices[cascadeIndex] = m_shadowCascades[cascadeIndex].worldToShadowTexture;
@@ -1588,8 +1839,12 @@ void Renderer::RenderSceneToHdr()
     m_deviceContext->VSSetConstantBuffers(1, 1, objectBuffers);
     m_deviceContext->PSSetConstantBuffers(1, 1, objectBuffers);
 
-    ID3D11ShaderResourceView* shadowResources[] = { m_shadowMapShaderResourceView.Get() };
-    ID3D11SamplerState* shadowSamplers[] = { m_shadowComparisonSampler.Get() };
+    ID3D11ShaderResourceView* shadowResources[] =
+    {
+        m_shadowMapShaderResourceView.Get(),
+        m_ssaoTexture.shaderResourceView.Get(),
+    };
+    ID3D11SamplerState* shadowSamplers[] = { m_shadowComparisonSampler.Get(), m_pointClampSampler.Get() };
     m_deviceContext->PSSetShaderResources(0, ARRAYSIZE(shadowResources), shadowResources);
     m_deviceContext->PSSetSamplers(0, ARRAYSIZE(shadowSamplers), shadowSamplers);
 
@@ -1598,7 +1853,7 @@ void Renderer::RenderSceneToHdr()
         DrawSceneObject(object);
     }
 
-    ID3D11ShaderResourceView* nullSrvs[] = { nullptr };
+    ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr };
     m_deviceContext->PSSetShaderResources(0, ARRAYSIZE(nullSrvs), nullSrvs);
 
     EndEvent();
@@ -2029,6 +2284,8 @@ void Renderer::Render()
 
     BeginEvent(L"Frame");
     RenderShadowMaps();
+    RenderNormalDepthPrepass();
+    RenderAmbientOcclusion();
     RenderSceneToHdr();
     ComputeAverageLuminance();
     AdaptEye(deltaTime);
@@ -2091,6 +2348,8 @@ void Renderer::Cleanup()
     m_sceneFrameConstantBuffer.Reset();
     m_sceneObjectConstantBuffer.Reset();
     m_shadowFrameConstantBuffer.Reset();
+    m_normalPrepassConstantBuffer.Reset();
+    m_ssaoConstantBuffer.Reset();
     m_downsampleConstantBuffer.Reset();
     m_adaptationConstantBuffer.Reset();
     m_toneMappingConstantBuffer.Reset();
@@ -2099,6 +2358,8 @@ void Renderer::Cleanup()
     m_sceneVertexShader.Reset();
     m_scenePixelShader.Reset();
     m_fullscreenVertexShader.Reset();
+    m_normalPrepassPixelShader.Reset();
+    m_ssaoPixelShader.Reset();
     m_luminanceInitialPixelShader.Reset();
     m_luminanceReducePixelShader.Reset();
     m_luminanceAdaptPixelShader.Reset();
@@ -2176,6 +2437,17 @@ LRESULT Renderer::HandleWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LP
         if (wParam < m_keyStates.size())
         {
             m_keyStates[static_cast<size_t>(wParam)] = true;
+        }
+
+        if (wParam == 'O' && (lParam & (1u << 30)) == 0)
+        {
+            m_ssaoEnabled = !m_ssaoEnabled;
+            UpdateWindowTitle();
+        }
+        else if (wParam == 'P' && (lParam & (1u << 30)) == 0)
+        {
+            m_ssaoPreviewEnabled = !m_ssaoPreviewEnabled;
+            UpdateWindowTitle();
         }
 
         return 0;
