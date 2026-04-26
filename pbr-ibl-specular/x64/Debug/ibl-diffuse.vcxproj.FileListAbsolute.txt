@@ -1,0 +1,3 @@
+C:\Users\zxnkxn\source\repos\gfx-dx11\x64\Debug\assets\hdri\glasshouse_interior_4k.hdr
+C:\Users\zxnkxn\source\repos\gfx-dx11\ibl-diffuse\x64\Debug\assets\hdri\glasshouse_interior_4k.hdr
+C:\Users\zxnkxn\source\repos\gfx-dx11\ibl-diffuse\x64\Debug\ibl-diffuse.exe
