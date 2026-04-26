@@ -1,4 +1,4 @@
-# DirectX 11 IBL Diffuse + Specular Application
+# DirectX 11 IBL Diffuse Application
 
 DirectX 11 application rendering a PBR sphere grid with HDRI-based environment lighting.
 
@@ -8,10 +8,7 @@ DirectX 11 application rendering a PBR sphere grid with HDRI-based environment l
 - Converts the equirectangular HDRI texture into a cubemap texture on the GPU
 - Displays the converted cubemap on the environment sphere
 - Builds an irradiance cubemap from the environment cubemap
-- Builds a prefiltered specular cubemap with roughness encoded in mip levels
-- Builds a BRDF integration LUT for split-sum environment specular
 - Uses the irradiance map in the PBR shader for ambient diffuse lighting
-- Uses the prefiltered cubemap and BRDF LUT in the PBR shader for ambient specular reflections
 - Keeps three point lights for direct lighting and allows toggling them with the `L` key
 - Preserves the PBR debug modes for NDF, Geometry, and Fresnel with digit keys `1..4`
 
