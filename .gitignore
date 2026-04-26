@@ -1,0 +1,18 @@
+# Visual Studio
+.vs/
+*.vcxproj.user
+
+# Build outputs
+x64/
+*/x64/
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.iobj
+*.ipdb
+*.log
+*.tlog/
+*.exe.recipe
+*.lastbuildstate
+*.FileListAbsolute.txt
