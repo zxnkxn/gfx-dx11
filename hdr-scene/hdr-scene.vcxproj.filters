@@ -46,9 +46,6 @@
     <FxCompile Include="src\shaders\scene_vertex_shader.hlsl">
       <Filter>Shader Files</Filter>
     </FxCompile>
-    <FxCompile Include="src\shaders\shadow_vertex_shader.hlsl">
-      <Filter>Shader Files</Filter>
-    </FxCompile>
     <FxCompile Include="src\shaders\tone_mapping_pixel_shader.hlsl">
       <Filter>Shader Files</Filter>
     </FxCompile>

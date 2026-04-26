@@ -1,13 +1,15 @@
+struct PointLightData
+{
+    float4 positionRadius;
+    float4 colorIntensity;
+};
+
 cbuffer SceneFrameConstants : register(b0)
 {
     row_major float4x4 viewProjection;
     float4 cameraPosition;
-    float4 cameraForward;
-    float4 lightDirectionIntensity;
-    float4 lightColorAmbient;
-    float4 cascadeSplits;
-    float4 shadowTexelData;
-    row_major float4x4 shadowMatrices[4];
+    PointLightData pointLights[3];
+    float4 globalParameters;
 };
 
 cbuffer SceneObjectConstants : register(b1)
@@ -29,7 +31,6 @@ struct PSInput
     float3 worldPosition : TEXCOORD0;
     float3 normal : TEXCOORD1;
     float3 albedo : TEXCOORD2;
-    float viewDepth : TEXCOORD3;
 };
 
 PSInput VS(VSInput input)
@@ -41,7 +42,6 @@ PSInput VS(VSInput input)
     output.worldPosition = worldPosition.xyz;
     output.normal = normalize(mul(float4(input.normal, 0.0f), normalMatrix).xyz);
     output.albedo = albedo.rgb;
-    output.viewDepth = dot(worldPosition.xyz - cameraPosition.xyz, cameraForward.xyz);
 
     return output;
 }

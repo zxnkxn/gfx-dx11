@@ -6,4 +6,8 @@
   <Project Path="cube-renderer/cube-renderer.vcxproj" Id="897677c6-5db2-4652-a6c9-c62dda73c359" />
   <Project Path="hdr-scene/hdr-scene.vcxproj" Id="6c6127bf-bf1a-4535-81c3-ff6e261820d4" />
   <Project Path="ibl-diffuse/ibl-diffuse.vcxproj" Id="f3876d8e-4d24-4ef0-9d38-14fe1dd7fec4" />
+  <Project Path="pbr-ibl-specular/pbr-ibl-specular.vcxproj" Id="9b1a2f3c-0e4d-4ab4-8e2a-3d0f95a8c1e7" />
+  <Project Path="gltf-metallic-roughness/gltf-metallic-roughness.vcxproj" Id="3f6a1b8d-7c2e-4e35-b934-8aa51568d3f1" />
+  <Project Path="emissive-bloom/emissive-bloom.vcxproj" Id="4c1d0a92-5e74-4d8b-9af3-2b0c7e1d65aa" />
+  <Project Path="task-csm-shadows/task-csm-shadows.vcxproj" Id="a6e3d4f1-2b8c-47a7-98f0-41d5c2b9e6ac" />
 </Solution>
