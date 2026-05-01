@@ -29,12 +29,13 @@ namespace
     constexpr UINT kSphereLongitudeSegments = 64;
     constexpr UINT kEnvironmentCubemapSize = 64;
     constexpr UINT kEnvironmentCubemapMipLevels = 7;
-    constexpr UINT kSphereGridWidth = 6;
-    constexpr UINT kSphereGridHeight = 6;
-    constexpr float kSphereGridSpacing = 2.35f;
-    constexpr float kSphereScale = 0.78f;
+    constexpr UINT kSphereGridWidth = 9;
+    constexpr UINT kSphereGridHeight = 9;
+    constexpr float kSphereGridSpacing = 1.12f;
+    constexpr float kSphereScale = 0.38f;
     constexpr float kEnvironmentSphereScale = 80.0f;
-    constexpr float kEnvironmentIntensity = 0.32f;
+    constexpr float kEnvironmentIntensity = 0.10f;
+    constexpr float kCameraFieldOfViewDegrees = 32.0f;
 
     void SetDebugName(ID3D11DeviceChild* resource, std::string_view name) noexcept
     {
@@ -142,25 +143,11 @@ namespace
     XMFLOAT3 EvaluateEnvironmentColor(const XMFLOAT3& direction)
     {
         const float skyBlend = Clamp01(direction.y * 0.5f + 0.5f);
-        const XMVECTOR groundColor = XMVectorSet(0.05f, 0.05f, 0.06f, 0.0f);
-        const XMVECTOR horizonColor = XMVectorSet(0.76f, 0.83f, 0.92f, 0.0f);
-        const XMVECTOR skyColor = XMVectorSet(0.21f, 0.43f, 0.77f, 0.0f);
-
-        const float upperBlend = std::pow(skyBlend, 0.85f);
-        const XMVECTOR lowerLayer = XMVectorLerp(groundColor, horizonColor, skyBlend);
-        const XMVECTOR baseColor = XMVectorLerp(lowerLayer, skyColor, upperBlend);
-
-        const XMFLOAT3 sunDirection = NormalizeFloat3(XMFLOAT3(-0.4f, 0.85f, 0.25f));
-        const XMVECTOR directionVector = XMLoadFloat3(&direction);
-        const XMVECTOR sunDirectionVector = XMLoadFloat3(&sunDirection);
-        const float sunAmount = std::pow(Clamp01(XMVectorGetX(XMVector3Dot(directionVector, sunDirectionVector))), 96.0f);
-        const XMVECTOR sunColor = XMVectorSet(1.0f, 0.92f, 0.72f, 0.0f) * (sunAmount * 1.45f);
+        const XMVECTOR lowerColor = XMVectorSet(0.07f, 0.07f, 0.07f, 0.0f);
+        const XMVECTOR upperColor = XMVectorSet(0.16f, 0.16f, 0.16f, 0.0f);
 
         XMFLOAT3 color = {};
-        XMStoreFloat3(&color, XMVectorAdd(baseColor, sunColor));
-        color.x = Clamp01(color.x);
-        color.y = Clamp01(color.y);
-        color.z = Clamp01(color.z);
+        XMStoreFloat3(&color, XMVectorLerp(lowerColor, upperColor, skyBlend));
         return color;
     }
 
@@ -204,9 +191,9 @@ Renderer::Renderer() :
     m_isOrbiting(false),
     m_lastMousePosition{},
     m_cameraTarget(0.0f, 0.0f, 0.0f),
-    m_cameraDistance(17.0f),
-    m_cameraYaw(0.65f),
-    m_cameraPitch(-0.38f),
+    m_cameraDistance(14.0f),
+    m_cameraYaw(0.0f),
+    m_cameraPitch(0.0f),
     m_cameraPosition(0.0f, 0.0f, 0.0f),
     m_displayMode(DisplayMode::Pbr),
     m_debugLayerEnabled(false)
@@ -582,7 +569,9 @@ HRESULT Renderer::CreatePipelineStates()
 {
     D3D11_RASTERIZER_DESC rasterizerDesc = {};
     rasterizerDesc.FillMode = D3D11_FILL_SOLID;
-    rasterizerDesc.CullMode = D3D11_CULL_BACK;
+    // The generated sphere mesh uses the opposite winding from D3D's default front-face
+    // convention. Disable culling so the visible hemisphere is shaded correctly.
+    rasterizerDesc.CullMode = D3D11_CULL_NONE;
     rasterizerDesc.DepthClipEnable = TRUE;
 
     HRESULT hr = m_device->CreateRasterizerState(&rasterizerDesc, m_rasterizerState.ReleaseAndGetAddressOf());
@@ -933,16 +922,16 @@ void Renderer::CreateSceneObjects()
         for (UINT column = 0; column < kSphereGridWidth; ++column)
         {
             const float x = static_cast<float>(column) * kSphereGridSpacing - gridWidthOffset;
-            const float z = static_cast<float>(row) * kSphereGridSpacing - gridHeightOffset;
+            const float y = static_cast<float>(row) * kSphereGridSpacing - gridHeightOffset;
             const float roughnessT = static_cast<float>(column) / static_cast<float>(kSphereGridWidth - 1u);
             const float metalnessT = static_cast<float>(row) / static_cast<float>(kSphereGridHeight - 1u);
 
             SphereInstance instance = {};
             instance.world = CreateWorldMatrix(
                 XMFLOAT3(kSphereScale, kSphereScale, kSphereScale),
-                XMFLOAT3(x, 0.0f, z));
-            instance.albedo = XMFLOAT3(0.95f, 0.56f, 0.16f);
-            instance.roughness = std::clamp(0.02f + std::pow(roughnessT, 1.75f) * 0.96f, 0.02f, 0.98f);
+                XMFLOAT3(x, y, 0.0f));
+            instance.albedo = XMFLOAT3(1.0f, 0.71f, 0.29f);
+            instance.roughness = std::clamp(0.1f + roughnessT * 0.9f, 0.1f, 1.0f);
             instance.metalness = std::clamp(metalnessT, 0.0f, 1.0f);
             instance.emissiveStrength = 0.0f;
 
@@ -953,10 +942,12 @@ void Renderer::CreateSceneObjects()
 
 void Renderer::InitializeLights()
 {
-    // Keep the lights close enough to the grid so their colored contribution is easy to read.
-    m_pointLights[0] = { XMFLOAT3(-6.5f, 4.5f, -5.5f), 18.0f, XMFLOAT3(1.0f, 0.22f, 0.18f), 260.0f };
-    m_pointLights[1] = { XMFLOAT3(0.0f, 5.6f, 3.6f), 18.0f, XMFLOAT3(0.25f, 1.0f, 0.36f), 260.0f };
-    m_pointLights[2] = { XMFLOAT3(6.5f, 4.5f, -5.8f), 18.0f, XMFLOAT3(0.22f, 0.55f, 1.0f), 260.0f };
+    // Light setup for the lecture-like previews:
+    // - PBR / NDF / Geometry use an offset light to make the lobe easier to read.
+    // - Fresnel uses a centered light halfway between the camera and the grid.
+    m_pointLights[0] = { XMFLOAT3(-2.2f, 5.0f, -4.8f), 18.0f, XMFLOAT3(1.0f, 1.0f, 1.0f), 1500.0f };
+    m_pointLights[1] = { XMFLOAT3(0.0f, 0.0f, -7.0f), 18.0f, XMFLOAT3(1.0f, 1.0f, 1.0f), 900.0f };
+    m_pointLights[2] = { XMFLOAT3(0.0f, 0.0f, 0.0f), 1.0f, XMFLOAT3(0.0f, 0.0f, 0.0f), 0.0f };
 }
 
 void Renderer::UpdateWindowTitle()
@@ -986,7 +977,7 @@ void Renderer::UpdateWindowTitle()
 
     const std::wstring title =
         m_title +
-        L" | 1 PBR | 2 NDF | 3 Geometry | 4 Fresnel | Debug modes use analytic preview | Roughness: left->right | Metalness: front->back | LMB orbit | Wheel zoom | Mode " +
+        L" | 1 PBR | 2 NDF | 3 Geometry | 4 Fresnel | Light sphere marks point source | Roughness: left->right | Metalness: bottom->top | LMB orbit | Wheel zoom | R reset | Mode " +
         std::wstring(modeName);
 
     SetWindowTextW(m_hwnd, title.c_str());
@@ -995,9 +986,9 @@ void Renderer::UpdateWindowTitle()
 void Renderer::ResetCamera()
 {
     m_cameraTarget = XMFLOAT3(0.0f, 0.0f, 0.0f);
-    m_cameraDistance = 17.0f;
-    m_cameraYaw = 0.65f;
-    m_cameraPitch = -0.38f;
+    m_cameraDistance = 14.0f;
+    m_cameraYaw = 0.0f;
+    m_cameraPitch = 0.0f;
     UpdateCamera();
 }
 
@@ -1017,7 +1008,8 @@ void Renderer::UpdateCamera()
 
     const XMMATRIX viewMatrix = XMMatrixLookAtLH(cameraPosition, target, XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f));
     const float aspectRatio = (m_height > 0) ? (static_cast<float>(m_width) / static_cast<float>(m_height)) : 1.0f;
-    const XMMATRIX projectionMatrix = XMMatrixPerspectiveFovLH(XMConvertToRadians(60.0f), aspectRatio, 0.1f, 300.0f);
+    const XMMATRIX projectionMatrix =
+        XMMatrixPerspectiveFovLH(XMConvertToRadians(kCameraFieldOfViewDegrees), aspectRatio, 0.1f, 300.0f);
 
     XMStoreFloat4x4(&m_viewMatrix, viewMatrix);
     XMStoreFloat4x4(&m_projectionMatrix, projectionMatrix);
@@ -1066,13 +1058,28 @@ void Renderer::RenderSpheres()
 {
     BeginEvent(L"PBRSpherePass");
 
+    std::array<PointLight, 3> activeLights = {};
+    for (PointLight& light : activeLights)
+    {
+        light = { XMFLOAT3(0.0f, 0.0f, 0.0f), 1.0f, XMFLOAT3(0.0f, 0.0f, 0.0f), 0.0f };
+    }
+
+    if (m_displayMode == DisplayMode::Fresnel)
+    {
+        activeLights[0] = m_pointLights[1];
+    }
+    else
+    {
+        activeLights[0] = m_pointLights[0];
+    }
+
     SceneFrameConstants sceneFrameConstants = {};
     sceneFrameConstants.viewProjection = StoreMatrix(XMLoadFloat4x4(&m_viewMatrix) * XMLoadFloat4x4(&m_projectionMatrix));
     sceneFrameConstants.cameraPosition = XMFLOAT4(m_cameraPosition.x, m_cameraPosition.y, m_cameraPosition.z, 1.0f);
 
-    for (size_t lightIndex = 0; lightIndex < m_pointLights.size(); ++lightIndex)
+    for (size_t lightIndex = 0; lightIndex < activeLights.size(); ++lightIndex)
     {
-        const PointLight& light = m_pointLights[lightIndex];
+        const PointLight& light = activeLights[lightIndex];
         sceneFrameConstants.pointLights[lightIndex].positionRadius =
             XMFLOAT4(light.position.x, light.position.y, light.position.z, light.radius);
         sceneFrameConstants.pointLights[lightIndex].colorIntensity =
@@ -1080,7 +1087,11 @@ void Renderer::RenderSpheres()
     }
 
     sceneFrameConstants.globalParameters =
-        XMFLOAT4(static_cast<float>(static_cast<int>(m_displayMode)), kEnvironmentIntensity, 0.0f, 0.0f);
+        XMFLOAT4(
+            static_cast<float>(static_cast<int>(m_displayMode)),
+            kEnvironmentIntensity,
+            kSphereGridSpacing,
+            kSphereScale);
     UpdateConstantBuffer(m_deviceContext.Get(), m_sceneFrameConstantBuffer, sceneFrameConstants);
 
     const UINT stride = sizeof(SceneVertex);
@@ -1111,22 +1122,27 @@ void Renderer::RenderSpheres()
         DrawSphereInstance(instance);
     }
 
-    for (size_t lightIndex = 0; lightIndex < m_pointLights.size(); ++lightIndex)
+    for (size_t lightIndex = 0; lightIndex < activeLights.size(); ++lightIndex)
     {
-        if (m_displayMode != DisplayMode::Pbr)
+        if (m_displayMode == DisplayMode::NormalDistribution || m_displayMode == DisplayMode::Geometry)
         {
             continue;
         }
 
-        const PointLight& light = m_pointLights[lightIndex];
+        const PointLight& light = activeLights[lightIndex];
+        if (light.intensity <= 0.0f)
+        {
+            continue;
+        }
+
         SphereInstance marker = {};
         marker.world = CreateWorldMatrix(
-            XMFLOAT3(0.34f, 0.34f, 0.34f),
+            XMFLOAT3(0.08f, 0.08f, 0.08f),
             light.position);
         marker.albedo = light.color;
         marker.roughness = 0.05f;
-        marker.metalness = 1.0f;
-        marker.emissiveStrength = 3.6f;
+        marker.metalness = 0.0f;
+        marker.emissiveStrength = 5.0f;
         DrawSphereInstance(marker);
     }
 

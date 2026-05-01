@@ -35,6 +35,18 @@ struct PSInput
 TextureCube<float4> environmentMap : register(t0);
 SamplerState linearClampSampler : register(s0);
 
+float3 SafeNormalize(float3 value, float3 fallback)
+{
+    const float lengthSquared = dot(value, value);
+    float3 normalizedValue = fallback;
+    if (lengthSquared > 1.0e-8f)
+    {
+        normalizedValue = value * rsqrt(lengthSquared);
+    }
+
+    return normalizedValue;
+}
+
 float DistributionGGX(float NdotH, float roughness)
 {
     const float clampedRoughness = clamp(roughness, 0.045f, 1.0f);
@@ -90,7 +102,7 @@ float ComputePointLightAttenuation(float distanceToLight, float radius)
 float4 PS(PSInput input) : SV_Target
 {
     const float3 N = normalize(input.normal);
-    const float3 V = normalize(cameraPosition.xyz - input.worldPosition);
+    const float3 V = SafeNormalize(cameraPosition.xyz - input.worldPosition, N);
     const int displayMode = (int)globalParameters.x;
 
     const float clampedRoughness = clamp(input.roughness, 0.045f, 1.0f);
@@ -108,52 +120,31 @@ float4 PS(PSInput input) : SV_Target
         return float4(gammaCorrectedEmissive, 1.0f);
     }
 
-    if (displayMode != 0)
+    if (displayMode == 1 || displayMode == 2)
     {
-        // Use a stable analytic preview for the BRDF terms so the debug modes
-        // stay readable and are not tied to the scene lighting composition.
-        const float3 debugNormal = (dot(N, V) >= 0.0f) ? N : -N;
-        const float3 debugViewDirection = normalize(V);
-        const float3 referenceUp = (abs(debugViewDirection.y) < 0.95f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
-        const float3 debugTangent = normalize(cross(referenceUp, debugViewDirection));
-        const float3 debugBitangent = normalize(cross(debugViewDirection, debugTangent));
-
-        const float debugNdotV = clamp(dot(debugNormal, debugViewDirection), 0.0f, 1.0f);
-
-        const float3 debugNdfLightDirection =
-            normalize(debugViewDirection * 0.80f - debugTangent * 0.52f + debugBitangent * 0.30f);
-        const float3 debugNdfHalfVector = normalize(debugViewDirection + debugNdfLightDirection);
-        const float debugNdfNdotH = clamp(dot(debugNormal, debugNdfHalfVector), 0.0f, 1.0f);
-        const float debugDistribution = DistributionGGX(debugNdfNdotH, clampedRoughness);
-
-        const float3 debugGeometryLightDirection =
-            normalize(debugViewDirection * 0.32f - debugTangent * 0.88f + debugBitangent * 0.18f);
-        const float debugGeometryNdotL = clamp(dot(debugNormal, debugGeometryLightDirection), 0.0f, 1.0f);
-        const float debugGeometry = GeometrySmith(debugNdotV, debugGeometryNdotL, clampedRoughness);
-
-        const float3 debugFresnelLightDirection =
-            normalize(-debugViewDirection * 0.45f - debugTangent * 0.82f + debugBitangent * 0.35f);
-        const float3 debugFresnelHalfVector = normalize(debugViewDirection + debugFresnelLightDirection);
-        const float debugFresnelHdotV = clamp(dot(debugFresnelHalfVector, debugViewDirection), 0.0f, 1.0f);
-        const float3 debugF0 = lerp(float3(0.03f, 0.14f, 0.72f), albedoColor, clampedMetalness);
-        const float3 debugFresnel = FresnelSchlick(debugFresnelHdotV, debugF0);
+        const float3 previewForward = float3(0.0f, 0.0f, -1.0f);
+        const float previewNdotV = clamp(dot(N, previewForward), 0.0f, 1.0f);
+        const float3 previewLightDirection = SafeNormalize(float3(-0.18f, 0.14f, -1.0f), previewForward);
+        const float previewNdotL = clamp(dot(N, previewLightDirection), 0.0f, 1.0f);
+        const float3 previewHalfVector = SafeNormalize(previewForward + previewLightDirection, previewForward);
+        const float previewNdotH = clamp(dot(N, previewHalfVector), 0.0f, 1.0f);
 
         if (displayMode == 1)
         {
+            const float lobeExponent = lerp(420.0f, 7.0f, clampedRoughness);
+            const float specularLobe = pow(previewNdotH, lobeExponent);
+            const float bodyFloor = lerp(0.01f, 0.07f, sqrt(clampedRoughness));
+            const float energyScale = lerp(1.00f, 0.48f, sqrt(clampedRoughness));
             const float distributionValue =
-                pow(clamp(log2(1.0f + debugDistribution * 96.0f) / 7.0f, 0.0f, 1.0f), 0.42f);
-            const float3 debugColor = pow(lerp(0.08f.xxx, 1.0f.xxx, distributionValue), 1.0f / 2.2f);
+                clamp(bodyFloor * pow(previewNdotV, 0.20f) + specularLobe * energyScale, 0.0f, 1.0f);
+            const float3 debugColor = pow(distributionValue.xxx, 1.0f / 2.2f);
             return float4(debugColor, 1.0f);
         }
 
-        if (displayMode == 2)
-        {
-            const float geometryValue = pow(clamp(debugGeometry, 0.0f, 1.0f), 0.55f);
-            const float3 debugColor = pow(lerp(0.08f.xxx, 1.0f.xxx, geometryValue), 1.0f / 2.2f);
-            return float4(debugColor, 1.0f);
-        }
-
-        const float3 debugColor = pow(clamp(debugFresnel, 0.0f.xxx, 1.0f.xxx), 1.0f / 2.2f);
+        const float previewGeometry = GeometrySmith(previewNdotV, previewNdotL, clampedRoughness);
+        const float geometryValue =
+            clamp(pow(previewNdotL, 0.22f) * lerp(1.0f, 0.93f, clampedRoughness) * (0.92f + 0.08f * previewGeometry), 0.0f, 1.0f);
+        const float3 debugColor = pow(clamp(geometryValue, 0.0f, 1.0f).xxx, 1.0f / 2.2f);
         return float4(debugColor, 1.0f);
     }
 
@@ -165,20 +156,17 @@ float4 PS(PSInput input) : SV_Target
     [unroll]
     for (int lightIndex = 0; lightIndex < 3; ++lightIndex)
     {
-        const float3 toLight = pointLights[lightIndex].positionRadius.xyz - input.worldPosition;
-        const float distanceToLight = max(length(toLight), 0.001f);
-        const float3 L = toLight / distanceToLight;
-        const float3 H = normalize(V + L);
-
-        const float NdotL = clamp(dot(N, L), 0.0f, 1.0f);
-        const float NdotV = clamp(dot(N, V), 0.0f, 1.0f);
-
-        // Point lights must not affect the surface from the opposite side.
-        if (NdotL <= 0.0f || NdotV <= 0.0f)
+        if (pointLights[lightIndex].colorIntensity.w <= 0.0f)
         {
             continue;
         }
 
+        const float3 toLight = pointLights[lightIndex].positionRadius.xyz - input.worldPosition;
+        const float distanceToLight = max(length(toLight), 0.001f);
+        const float3 L = toLight / distanceToLight;
+        const float NdotL = clamp(dot(N, L), 0.0f, 1.0f);
+        const float NdotV = clamp(dot(N, V), 0.0f, 1.0f);
+        const float3 H = SafeNormalize(V + L, N);
         const float NdotH = clamp(dot(N, H), 0.0f, 1.0f);
         const float HdotV = clamp(dot(H, V), 0.0f, 1.0f);
 
@@ -189,6 +177,12 @@ float4 PS(PSInput input) : SV_Target
         accumulatedDistribution = max(accumulatedDistribution, D);
         accumulatedGeometry = max(accumulatedGeometry, G);
         accumulatedFresnel = max(accumulatedFresnel, F);
+
+        // Point lights must not affect the surface from the opposite side.
+        if (NdotL <= 0.0f || NdotV <= 0.0f)
+        {
+            continue;
+        }
 
         const float3 numerator = D * G * F;
         const float denominator = max(4.0f * NdotV * NdotL, 1.0e-4f);
@@ -203,6 +197,27 @@ float4 PS(PSInput input) : SV_Target
         radianceSum += (kD * albedoColor / kPi + specular) * pointRadiance * NdotL;
     }
 
+    if (displayMode == 1)
+    {
+        const float distributionValue =
+            pow(clamp(log2(1.0f + accumulatedDistribution * 96.0f) / 7.0f, 0.0f, 1.0f), 0.42f);
+        const float3 debugColor = pow(clamp(distributionValue, 0.0f, 1.0f).xxx, 1.0f / 2.2f);
+        return float4(debugColor, 1.0f);
+    }
+
+    if (displayMode == 2)
+    {
+        const float geometryValue = pow(clamp(accumulatedGeometry, 0.0f, 1.0f), 0.18f);
+        const float3 debugColor = pow(clamp(geometryValue, 0.0f, 1.0f).xxx, 1.0f / 2.2f);
+        return float4(debugColor, 1.0f);
+    }
+
+    if (displayMode == 3)
+    {
+        const float3 debugColor = pow(clamp(accumulatedFresnel, 0.0f.xxx, 1.0f.xxx), 1.0f / 2.2f);
+        return float4(debugColor, 1.0f);
+    }
+
     const float NdotV = clamp(dot(N, V), 0.0f, 1.0f);
     const float3 Fambient = FresnelSchlickRoughness(NdotV, F0, clampedRoughness);
     const float3 kSambient = Fambient;
@@ -213,13 +228,13 @@ float4 PS(PSInput input) : SV_Target
     const float3 reflectionDirection = reflect(-V, N);
     const float3 environmentSpecular =
         environmentMap.SampleLevel(linearClampSampler, reflectionDirection, clampedRoughness * maxEnvironmentMipLevel).rgb *
-        lerp(1.15f, 0.35f, clampedRoughness);
+        lerp(0.55f, 0.18f, clampedRoughness);
     const float3 ambient =
         (kDambient * environmentDiffuse * albedoColor / kPi + environmentSpecular * kSambient) *
         max(globalParameters.y, 0.0f);
-    const float3 ambientBase = albedoColor * (1.0f - clampedMetalness) * 0.02f;
+    const float3 ambientBase = albedoColor * (1.0f - clampedMetalness) * 0.008f + F0 * 0.004f;
 
-    const float exposure = 1.2f;
+    const float exposure = 1.65f;
     const float3 finalColor = ambientBase + ambient + radianceSum;
     const float3 toneMappedColor = ToneMapReinhard(max(finalColor * exposure, 0.0f.xxx));
     const float3 gammaCorrectedColor = pow(clamp(toneMappedColor, 0.0f.xxx, 1.0f.xxx), 1.0f / 2.2f);
