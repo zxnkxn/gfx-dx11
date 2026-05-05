@@ -5,4 +5,5 @@
   </Configurations>
   <Project Path="cube-renderer/cube-renderer.vcxproj" Id="897677c6-5db2-4652-a6c9-c62dda73c359" />
   <Project Path="hdr-scene/hdr-scene.vcxproj" Id="6c6127bf-bf1a-4535-81c3-ff6e261820d4" />
+  <Project Path="pbr-sphere/pbr-sphere.vcxproj" Id="9e7cfc1d-62d6-4f0f-a347-2ce4b657c5a1" />
 </Solution>
