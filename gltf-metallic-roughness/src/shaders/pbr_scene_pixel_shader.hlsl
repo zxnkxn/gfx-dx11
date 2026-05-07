@@ -44,6 +44,18 @@ Texture2D<float4> occlusionTexture : register(t6);
 SamplerState linearClampSampler : register(s0);
 SamplerState linearWrapSampler : register(s1);
 
+float3 SafeNormalize(float3 value, float3 fallback)
+{
+    const float lengthSquared = dot(value, value);
+    float3 normalizedValue = fallback;
+    if (lengthSquared > 1.0e-8f)
+    {
+        normalizedValue = value * rsqrt(lengthSquared);
+    }
+
+    return normalizedValue;
+}
+
 float DistributionGGX(float NdotH, float roughness)
 {
     const float clampedRoughness = clamp(roughness, 0.045f, 1.0f);
@@ -98,12 +110,8 @@ float ComputePointLightAttenuation(float distanceToLight, float radius)
 
 float4 PS(PSInput input) : SV_Target
 {
-    const float3 V = normalize(cameraPosition.xyz - input.worldPosition);
-    const float3 geometricNormal = normalize(input.normal);
-    // Keep the shading normal oriented towards the camera. This makes the
-    // direct-light branch robust even if the visible sphere faces end up using
-    // the opposite winding/normal orientation.
-    const float3 N = (dot(geometricNormal, V) >= 0.0f) ? geometricNormal : -geometricNormal;
+    const float3 N = normalize(input.normal);
+    const float3 V = SafeNormalize(cameraPosition.xyz - input.worldPosition, N);
     const int displayMode = (int)globalParameters.x;
     const int alphaMode = (int)materialFlags.x;
 
@@ -138,28 +146,28 @@ float4 PS(PSInput input) : SV_Target
     {
         // Use a stable analytic preview for the BRDF terms so the debug modes
         // stay readable and are not tied to the scene lighting composition.
-        const float3 debugNormal = (dot(N, V) >= 0.0f) ? N : -N;
-        const float3 debugViewDirection = normalize(V);
+        const float3 debugNormal = N;
+        const float3 debugViewDirection = V;
         const float3 referenceUp = (abs(debugViewDirection.y) < 0.95f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
-        const float3 debugTangent = normalize(cross(referenceUp, debugViewDirection));
-        const float3 debugBitangent = normalize(cross(debugViewDirection, debugTangent));
+        const float3 debugTangent = SafeNormalize(cross(referenceUp, debugViewDirection), float3(1.0f, 0.0f, 0.0f));
+        const float3 debugBitangent = SafeNormalize(cross(debugViewDirection, debugTangent), float3(0.0f, 1.0f, 0.0f));
 
         const float debugNdotV = clamp(dot(debugNormal, debugViewDirection), 0.0f, 1.0f);
 
         const float3 debugNdfLightDirection =
-            normalize(debugViewDirection * 0.80f - debugTangent * 0.52f + debugBitangent * 0.30f);
-        const float3 debugNdfHalfVector = normalize(debugViewDirection + debugNdfLightDirection);
+            SafeNormalize(debugViewDirection * 0.80f - debugTangent * 0.52f + debugBitangent * 0.30f, debugViewDirection);
+        const float3 debugNdfHalfVector = SafeNormalize(debugViewDirection + debugNdfLightDirection, debugViewDirection);
         const float debugNdfNdotH = clamp(dot(debugNormal, debugNdfHalfVector), 0.0f, 1.0f);
         const float debugDistribution = DistributionGGX(debugNdfNdotH, clampedRoughness);
 
         const float3 debugGeometryLightDirection =
-            normalize(debugViewDirection * 0.32f - debugTangent * 0.88f + debugBitangent * 0.18f);
+            SafeNormalize(debugViewDirection * 0.32f - debugTangent * 0.88f + debugBitangent * 0.18f, debugViewDirection);
         const float debugGeometryNdotL = clamp(dot(debugNormal, debugGeometryLightDirection), 0.0f, 1.0f);
         const float debugGeometry = GeometrySmith(debugNdotV, debugGeometryNdotL, clampedRoughness);
 
         const float3 debugFresnelLightDirection =
-            normalize(-debugViewDirection * 0.45f - debugTangent * 0.82f + debugBitangent * 0.35f);
-        const float3 debugFresnelHalfVector = normalize(debugViewDirection + debugFresnelLightDirection);
+            SafeNormalize(-debugViewDirection * 0.45f - debugTangent * 0.82f + debugBitangent * 0.35f, -debugViewDirection);
+        const float3 debugFresnelHalfVector = SafeNormalize(debugViewDirection + debugFresnelLightDirection, debugViewDirection);
         const float debugFresnelHdotV = clamp(dot(debugFresnelHalfVector, debugViewDirection), 0.0f, 1.0f);
         const float3 debugF0 = lerp(float3(0.03f, 0.14f, 0.72f), albedoColor, clampedMetalness);
         const float3 debugFresnel = FresnelSchlick(debugFresnelHdotV, debugF0);
@@ -194,7 +202,7 @@ float4 PS(PSInput input) : SV_Target
         const float3 toLight = pointLights[lightIndex].positionRadius.xyz - input.worldPosition;
         const float distanceToLight = max(length(toLight), 0.001f);
         const float3 L = toLight / distanceToLight;
-        const float3 H = normalize(V + L);
+        const float3 H = SafeNormalize(V + L, N);
 
         const float NdotL = clamp(dot(N, L), 0.0f, 1.0f);
         const float NdotV = clamp(dot(N, V), 0.0f, 1.0f);
@@ -245,7 +253,7 @@ float4 PS(PSInput input) : SV_Target
 
     const float3 irradiance = irradianceMap.SampleLevel(linearClampSampler, N, 0.0f).rgb;
     const float3 ambientDiffuse = irradiance * albedoColor;
-    const float3 reflectionVector = normalize(reflect(-V, N));
+    const float3 reflectionVector = SafeNormalize(reflect(-V, N), N);
     const float maxReflectionLod = max(globalParameters.z, 0.0f);
     const float3 prefilteredColor =
         prefilteredEnvironmentMap.SampleLevel(

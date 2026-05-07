@@ -580,9 +580,7 @@ HRESULT Renderer::CreatePipelineStates()
 {
     D3D11_RASTERIZER_DESC rasterizerDesc = {};
     rasterizerDesc.FillMode = D3D11_FILL_SOLID;
-    // The generated sphere mesh uses the opposite winding from D3D's default
-    // front-face convention, so we keep both sides to shade the visible shell.
-    rasterizerDesc.CullMode = D3D11_CULL_NONE;
+    rasterizerDesc.CullMode = D3D11_CULL_BACK;
     rasterizerDesc.DepthClipEnable = TRUE;
 
     HRESULT hr = m_device->CreateRasterizerState(&rasterizerDesc, m_rasterizerState.ReleaseAndGetAddressOf());
