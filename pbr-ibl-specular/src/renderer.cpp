@@ -42,7 +42,7 @@ namespace
     constexpr float kSphereGridSpacing = 2.35f;
     constexpr float kSphereScale = 0.78f;
     constexpr float kEnvironmentSphereScale = 80.0f;
-    constexpr float kEnvironmentIntensity = 0.08f;
+    constexpr float kEnvironmentIntensity = 1.0f;
     constexpr float kMaxReflectionLod = static_cast<float>(kPrefilteredEnvironmentCubemapMipLevels - 1u);
 
     struct CubemapCaptureFace
@@ -201,6 +201,8 @@ Renderer::Renderer() :
     m_height(900),
     m_isMinimized(false),
     m_title(L"IBL Diffuse + Specular"),
+    m_previousFrameTime(std::chrono::steady_clock::now()),
+    m_keyStates{},
     m_isOrbiting(false),
     m_lastMousePosition{},
     m_cameraTarget(0.0f, 0.0f, 0.0f),
@@ -210,6 +212,7 @@ Renderer::Renderer() :
     m_cameraPosition(0.0f, 0.0f, 0.0f),
     m_displayMode(DisplayMode::Pbr),
     m_pointLightsEnabled(true),
+    m_specularIblEnabled(true),
     m_loadedHdriFileName(L"No HDRI"),
     m_debugLayerEnabled(false)
 {
@@ -248,6 +251,7 @@ HRESULT Renderer::Initialize(HINSTANCE hInstance, int nCmdShow)
     CreateSceneObjects();
     InitializeLights();
     ResetCamera();
+    m_previousFrameTime = std::chrono::steady_clock::now();
     UpdateWindowTitle();
 
     ShowWindow(m_hwnd, nCmdShow);
@@ -1460,6 +1464,18 @@ void Renderer::UpdateWindowTitle()
     case DisplayMode::DirectLighting:
         modeName = L"Direct";
         break;
+    case DisplayMode::DiffuseIbl:
+        modeName = L"Diffuse IBL";
+        break;
+    case DisplayMode::SpecularIbl:
+        modeName = L"Specular IBL";
+        break;
+    case DisplayMode::AmbientIbl:
+        modeName = L"Ambient IBL";
+        break;
+    case DisplayMode::Reflection:
+        modeName = L"Reflection";
+        break;
     case DisplayMode::Pbr:
     default:
         modeName = L"PBR";
@@ -1468,14 +1484,69 @@ void Renderer::UpdateWindowTitle()
 
     const std::wstring title =
         m_title +
-        L" | 1 PBR | 2 NDF | 3 Geometry | 4 Fresnel | 5 Direct lights | L toggle point lights | Debug modes use analytic preview | Roughness: left->right | Metalness: front->back | HDRI: " +
+        L" | LMB orbit | Mouse wheel zoom | WASD / Arrows move target | 1 PBR | 2 NDF | 3 Geometry | 4 Fresnel | 5 Direct | 6 Diffuse IBL | 7 Specular IBL | 8 Ambient IBL | 9 Reflection | L lights | I specular IBL | Roughness: left->right | Metalness: front->back | HDRI: " +
         m_loadedHdriFileName +
         L" | Lights " +
         std::wstring(m_pointLightsEnabled ? L"On" : L"Off") +
+        L" | Specular IBL " +
+        std::wstring(m_specularIblEnabled ? L"On" : L"Off") +
         L" | Mode " +
         std::wstring(modeName);
 
     SetWindowTextW(m_hwnd, title.c_str());
+}
+
+void Renderer::Update(float deltaTime)
+{
+    XMVECTOR movementDirection = XMVectorZero();
+    const XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+    const XMVECTOR cameraPosition = XMLoadFloat3(&m_cameraPosition);
+    const XMVECTOR cameraTarget = XMLoadFloat3(&m_cameraTarget);
+
+    XMVECTOR forward = XMVectorSubtract(cameraTarget, cameraPosition);
+    forward = XMVectorSetY(forward, 0.0f);
+
+    if (XMVectorGetX(XMVector3LengthSq(forward)) < 1.0e-6f)
+    {
+        forward = XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f);
+    }
+    else
+    {
+        forward = XMVector3Normalize(forward);
+    }
+
+    const XMVECTOR right = XMVector3Normalize(XMVector3Cross(worldUp, forward));
+
+    if (m_keyStates['W'] || m_keyStates[VK_UP])
+    {
+        movementDirection = XMVectorAdd(movementDirection, forward);
+    }
+
+    if (m_keyStates['S'] || m_keyStates[VK_DOWN])
+    {
+        movementDirection = XMVectorSubtract(movementDirection, forward);
+    }
+
+    if (m_keyStates['D'] || m_keyStates[VK_RIGHT])
+    {
+        movementDirection = XMVectorAdd(movementDirection, right);
+    }
+
+    if (m_keyStates['A'] || m_keyStates[VK_LEFT])
+    {
+        movementDirection = XMVectorSubtract(movementDirection, right);
+    }
+
+    if (XMVectorGetX(XMVector3LengthSq(movementDirection)) > 1.0e-6f)
+    {
+        constexpr float movementSpeed = 5.5f;
+        movementDirection = XMVector3Normalize(movementDirection);
+
+        const XMVECTOR movement = XMVectorScale(movementDirection, movementSpeed * deltaTime);
+        const XMVECTOR updatedTarget = XMVectorAdd(cameraTarget, movement);
+        XMStoreFloat3(&m_cameraTarget, updatedTarget);
+        UpdateCamera();
+    }
 }
 
 void Renderer::ResetCamera()
@@ -1566,7 +1637,11 @@ void Renderer::RenderSpheres()
     }
 
     sceneFrameConstants.globalParameters =
-        XMFLOAT4(static_cast<float>(static_cast<int>(m_displayMode)), kEnvironmentIntensity, kMaxReflectionLod, 0.0f);
+        XMFLOAT4(
+            static_cast<float>(static_cast<int>(m_displayMode)),
+            kEnvironmentIntensity,
+            kMaxReflectionLod,
+            m_specularIblEnabled ? 1.0f : 0.0f);
     UpdateConstantBuffer(m_deviceContext.Get(), m_sceneFrameConstantBuffer, sceneFrameConstants);
 
     const UINT stride = sizeof(SceneVertex);
@@ -1864,6 +1939,13 @@ void Renderer::Render()
         return;
     }
 
+    const auto currentTime = std::chrono::steady_clock::now();
+    float deltaTime = std::chrono::duration<float>(currentTime - m_previousFrameTime).count();
+    m_previousFrameTime = currentTime;
+    deltaTime = std::clamp(deltaTime, 0.0001f, 0.1f);
+
+    Update(deltaTime);
+
     BeginEvent(L"Frame");
 
     ID3D11RenderTargetView* renderTargets[] = { m_renderTargetView.Get() };
@@ -2017,6 +2099,11 @@ LRESULT Renderer::HandleWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LP
     }
 
     case WM_KEYDOWN:
+        if (wParam < m_keyStates.size())
+        {
+            m_keyStates[static_cast<size_t>(wParam)] = true;
+        }
+
         if (wParam == '1')
         {
             m_displayMode = DisplayMode::Pbr;
@@ -2042,6 +2129,26 @@ LRESULT Renderer::HandleWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LP
             m_displayMode = DisplayMode::DirectLighting;
             UpdateWindowTitle();
         }
+        else if (wParam == '6')
+        {
+            m_displayMode = DisplayMode::DiffuseIbl;
+            UpdateWindowTitle();
+        }
+        else if (wParam == '7')
+        {
+            m_displayMode = DisplayMode::SpecularIbl;
+            UpdateWindowTitle();
+        }
+        else if (wParam == '8')
+        {
+            m_displayMode = DisplayMode::AmbientIbl;
+            UpdateWindowTitle();
+        }
+        else if (wParam == '9')
+        {
+            m_displayMode = DisplayMode::Reflection;
+            UpdateWindowTitle();
+        }
         else if (wParam == 'R')
         {
             ResetCamera();
@@ -2051,9 +2158,22 @@ LRESULT Renderer::HandleWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LP
             m_pointLightsEnabled = !m_pointLightsEnabled;
             UpdateWindowTitle();
         }
+        else if (wParam == 'I')
+        {
+            m_specularIblEnabled = !m_specularIblEnabled;
+            UpdateWindowTitle();
+        }
+        return 0;
+
+    case WM_KEYUP:
+        if (wParam < m_keyStates.size())
+        {
+            m_keyStates[static_cast<size_t>(wParam)] = false;
+        }
         return 0;
 
     case WM_KILLFOCUS:
+        m_keyStates.fill(false);
         m_isOrbiting = false;
         if (GetCapture() == hwnd)
         {

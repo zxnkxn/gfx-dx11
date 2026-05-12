@@ -1,6 +1,6 @@
 static const float kPi = 3.14159265f;
-static const float kDirectDiffuseBoost = 6.0f;
-static const float kDirectSpecularBoost = 0.0f;
+static const float kDirectDiffuseBoost = 1.0f;
+static const float kDirectSpecularBoost = 1.0f;
 
 struct PointLightData
 {
@@ -113,6 +113,7 @@ float4 PS(PSInput input) : SV_Target
     const float clampedMetalness = clamp(input.metalness, 0.0f, 1.0f);
     const float3 albedoColor = clamp(input.albedo, 0.0f.xxx, 1.0f.xxx);
     const float emissiveStrength = max(materialParameters.z, 0.0f);
+    const bool specularIblEnabled = globalParameters.w > 0.5f;
 
     const float3 dielectricF0 = float3(0.04f, 0.04f, 0.04f);
     const float3 F0 = lerp(dielectricF0, albedoColor, clampedMetalness);
@@ -230,11 +231,37 @@ float4 PS(PSInput input) : SV_Target
         linearClampSampler,
         float2(NdotV, clampedRoughness),
         0.0f).rg;
-    const float3 ambientSpecular = prefilteredColor * (Fambient * brdf.x + brdf.y);
-    const float3 ambient = (kDambient * ambientDiffuse + ambientSpecular) * max(globalParameters.y, 0.0f);
+    const float3 ambientSpecular =
+        specularIblEnabled
+        ? prefilteredColor * (Fambient * brdf.x + brdf.y)
+        : 0.0f.xxx;
+    const float3 diffuseIbl = kDambient * ambientDiffuse;
+    const float environmentIntensity = max(globalParameters.y, 0.0f);
+    const float3 ambient = (diffuseIbl + ambientSpecular) * environmentIntensity;
 
     const float exposure = 1.2f;
-    const float3 finalColor = (displayMode == 4) ? radianceSum : (ambient + radianceSum);
+    float3 finalColor = ambient + radianceSum;
+    if (displayMode == 4)
+    {
+        finalColor = radianceSum;
+    }
+    else if (displayMode == 5)
+    {
+        finalColor = diffuseIbl * environmentIntensity;
+    }
+    else if (displayMode == 6)
+    {
+        finalColor = ambientSpecular * environmentIntensity;
+    }
+    else if (displayMode == 7)
+    {
+        finalColor = ambient;
+    }
+    else if (displayMode == 8)
+    {
+        finalColor = prefilteredColor;
+    }
+
     const float3 toneMappedColor = ToneMapReinhard(max(finalColor * exposure, 0.0f.xxx));
     const float3 gammaCorrectedColor = pow(clamp(toneMappedColor, 0.0f.xxx, 1.0f.xxx), 1.0f / 2.2f);
     return float4(gammaCorrectedColor, 1.0f);

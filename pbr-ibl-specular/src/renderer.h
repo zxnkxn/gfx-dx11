@@ -7,6 +7,7 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <chrono>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -40,6 +41,10 @@ private:
         Geometry = 2,
         Fresnel = 3,
         DirectLighting = 4,
+        DiffuseIbl = 5,
+        SpecularIbl = 6,
+        AmbientIbl = 7,
+        Reflection = 8,
     };
 
     struct PointLight
@@ -160,6 +165,7 @@ private:
     void ResizeSwapChain(UINT width, UINT height);
 
     // Camera and rendering
+    void Update(float deltaTime);
     void ResetCamera();
     void UpdateCamera();
     void RenderEnvironment();
@@ -191,9 +197,13 @@ private:
     bool m_isMinimized;
     std::wstring m_title;
 
-    // Input and camera
+    // Timing and input
+    std::chrono::steady_clock::time_point m_previousFrameTime;
+    std::array<bool, 256> m_keyStates;
     bool m_isOrbiting;
     POINT m_lastMousePosition;
+
+    // Camera
     DirectX::XMFLOAT3 m_cameraTarget;
     float m_cameraDistance;
     float m_cameraYaw;
@@ -207,6 +217,7 @@ private:
     std::array<PointLight, 3> m_pointLights;
     DisplayMode m_displayMode;
     bool m_pointLightsEnabled;
+    bool m_specularIblEnabled;
     std::wstring m_loadedHdriFileName;
 
     // DirectX core objects
