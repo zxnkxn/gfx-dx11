@@ -39,7 +39,7 @@ namespace
     constexpr float kSphereGridSpacing = 2.35f;
     constexpr float kSphereScale = 0.78f;
     constexpr float kEnvironmentSphereScale = 80.0f;
-    constexpr float kEnvironmentIntensity = 0.08f;
+    constexpr float kEnvironmentIntensity = 1.0f;
 
     struct CubemapCaptureFace
     {
@@ -106,6 +106,23 @@ namespace
     {
         std::error_code errorCode;
         return fs::is_regular_file(path, errorCode);
+    }
+
+    int GetHdriSearchPriority(const fs::path& path)
+    {
+        const std::wstring normalizedPath = path.lexically_normal().wstring();
+        if (normalizedPath.find(L"\\ibl-diffuse\\assets\\hdri\\") != std::wstring::npos ||
+            normalizedPath.find(L"\\assets\\hdri\\") != std::wstring::npos)
+        {
+            return 0;
+        }
+
+        if (normalizedPath.find(L"\\Lab4\\Lab4\\cubemaps\\") != std::wstring::npos)
+        {
+            return 1;
+        }
+
+        return 2;
     }
 
     void AppendHdrFilesFromDirectory(const fs::path& directory, std::vector<fs::path>& files)
@@ -204,9 +221,11 @@ Renderer::Renderer() :
     m_cameraYaw(0.65f),
     m_cameraPitch(-0.38f),
     m_cameraPosition(0.0f, 0.0f, 0.0f),
+    m_pointLightEnabled{ false, false, false },
     m_displayMode(DisplayMode::Pbr),
-    m_pointLightsEnabled(true),
+    m_previewIrradianceCubemap(false),
     m_loadedHdriFileName(L"No HDRI"),
+    m_currentHdriFileIndex(0),
     m_debugLayerEnabled(false)
 {
     XMStoreFloat4x4(&m_viewMatrix, XMMatrixIdentity());
@@ -248,6 +267,7 @@ HRESULT Renderer::Initialize(HINSTANCE hInstance, int nCmdShow)
 
     ShowWindow(m_hwnd, nCmdShow);
     UpdateWindow(m_hwnd);
+    ShowControls();
 
     return S_OK;
 }
@@ -912,19 +932,29 @@ HRESULT Renderer::CreateSphereMeshGeometry(UINT latitudeSegments, UINT longitude
 
 HRESULT Renderer::CreateEnvironmentCubemap()
 {
+    RefreshAvailableHdriFiles();
+    if (m_availableHdriFiles.empty())
+    {
+        m_loadedHdriFileName = L"Missing HDRI";
+        return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    }
+
+    if (m_currentHdriFileIndex >= m_availableHdriFiles.size())
+    {
+        m_currentHdriFileIndex = 0;
+    }
+
+    return CreateEnvironmentCubemap(m_availableHdriFiles[m_currentHdriFileIndex]);
+}
+
+HRESULT Renderer::CreateEnvironmentCubemap(const fs::path& hdriFilePath)
+{
     m_hdriTexture.Reset();
     m_hdriTextureShaderResourceView.Reset();
     m_environmentCubemap.Reset();
     m_environmentCubemapShaderResourceView.Reset();
     m_irradianceCubemap.Reset();
     m_irradianceCubemapShaderResourceView.Reset();
-
-    const fs::path hdriFilePath = FindHdriFile();
-    if (hdriFilePath.empty())
-    {
-        m_loadedHdriFileName = L"Missing HDRI";
-        return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
-    }
 
     HdriImage hdriImage = {};
     HRESULT hr = LoadRadianceHdrImage(hdriFilePath, hdriImage);
@@ -972,6 +1002,7 @@ HRESULT Renderer::CreateEnvironmentCubemap()
     }
 
     m_loadedHdriFileName = hdriFilePath.filename().wstring();
+    UpdateWindowTitle();
     return S_OK;
 }
 
@@ -1211,6 +1242,193 @@ void Renderer::InitializeLights()
     m_pointLights[2] = { XMFLOAT3(6.0f, 2.6f, -7.0f), 18.0f, XMFLOAT3(0.22f, 0.52f, 1.0f), 2.2f };
 }
 
+void Renderer::RefreshAvailableHdriFiles()
+{
+    const fs::path executableDirectory = GetExecutableDirectory();
+
+    std::error_code errorCode;
+    const fs::path currentDirectory = fs::current_path(errorCode);
+
+    std::vector<fs::path> searchDirectories;
+    searchDirectories.emplace_back(executableDirectory / L"assets" / L"hdri");
+    searchDirectories.emplace_back(executableDirectory / L"Lab4" / L"Lab4" / L"cubemaps");
+
+    if (!currentDirectory.empty())
+    {
+        searchDirectories.emplace_back(currentDirectory / L"assets" / L"hdri");
+        searchDirectories.emplace_back(currentDirectory / L"ibl-diffuse" / L"assets" / L"hdri");
+        searchDirectories.emplace_back(currentDirectory / L"Lab4" / L"Lab4" / L"cubemaps");
+    }
+
+    const fs::path twoLevelsUp = executableDirectory.parent_path().parent_path();
+    if (!twoLevelsUp.empty())
+    {
+        searchDirectories.emplace_back(twoLevelsUp / L"assets" / L"hdri");
+        searchDirectories.emplace_back(twoLevelsUp / L"ibl-diffuse" / L"assets" / L"hdri");
+        searchDirectories.emplace_back(twoLevelsUp / L"Lab4" / L"Lab4" / L"cubemaps");
+    }
+
+    const fs::path threeLevelsUp = twoLevelsUp.parent_path();
+    if (!threeLevelsUp.empty())
+    {
+        searchDirectories.emplace_back(threeLevelsUp / L"ibl-diffuse" / L"assets" / L"hdri");
+        searchDirectories.emplace_back(threeLevelsUp / L"Lab4" / L"Lab4" / L"cubemaps");
+    }
+
+    std::vector<fs::path> candidateFiles;
+    for (const fs::path& directory : searchDirectories)
+    {
+        AppendHdrFilesFromDirectory(directory, candidateFiles);
+    }
+
+    for (fs::path& candidateFile : candidateFiles)
+    {
+        candidateFile = candidateFile.lexically_normal();
+    }
+
+    std::sort(
+        candidateFiles.begin(),
+        candidateFiles.end(),
+        [](const fs::path& left, const fs::path& right)
+        {
+            const int leftPriority = GetHdriSearchPriority(left);
+            const int rightPriority = GetHdriSearchPriority(right);
+            if (leftPriority != rightPriority)
+            {
+                return leftPriority < rightPriority;
+            }
+
+            return left.native() < right.native();
+        });
+    candidateFiles.erase(std::unique(candidateFiles.begin(), candidateFiles.end()), candidateFiles.end());
+
+    if (m_currentHdriFileIndex < m_availableHdriFiles.size() &&
+        m_currentHdriFileIndex < candidateFiles.size() &&
+        m_availableHdriFiles[m_currentHdriFileIndex] == candidateFiles[m_currentHdriFileIndex])
+    {
+        m_availableHdriFiles = std::move(candidateFiles);
+        return;
+    }
+
+    fs::path selectedHdriPath;
+    if (m_currentHdriFileIndex < m_availableHdriFiles.size())
+    {
+        selectedHdriPath = m_availableHdriFiles[m_currentHdriFileIndex];
+    }
+    else if (!m_loadedHdriFileName.empty() && m_loadedHdriFileName != L"No HDRI")
+    {
+        for (const fs::path& candidateFile : candidateFiles)
+        {
+            if (candidateFile.filename() == m_loadedHdriFileName)
+            {
+                selectedHdriPath = candidateFile;
+                break;
+            }
+        }
+    }
+
+    m_availableHdriFiles = std::move(candidateFiles);
+    m_currentHdriFileIndex = 0;
+
+    if (!selectedHdriPath.empty())
+    {
+        for (size_t fileIndex = 0; fileIndex < m_availableHdriFiles.size(); ++fileIndex)
+        {
+            if (m_availableHdriFiles[fileIndex] == selectedHdriPath)
+            {
+                m_currentHdriFileIndex = fileIndex;
+                break;
+            }
+        }
+    }
+}
+
+void Renderer::ShowControls() const
+{
+    const wchar_t* message =
+        L"Mouse drag: orbit camera\n"
+        L"Mouse wheel: zoom\n"
+        L"R: reset camera\n"
+        L"Left / Right: switch HDRI and rebuild environment + irradiance cubemaps\n"
+        L"I: preview irradiance cubemap on the sky sphere\n"
+        L"L: toggle all analytic point lights\n"
+        L"7 / 8 / 9: toggle point lights 1 / 2 / 3\n"
+        L"1: PBR\n"
+        L"2: NDF preview\n"
+        L"3: Geometry preview\n"
+        L"4: Fresnel preview\n"
+        L"5: Direct lights only\n"
+        L"6: Ambient diffuse IBL only\n"
+        L"F1: show this help again";
+
+    MessageBoxW(
+        m_hwnd,
+        message,
+        L"IBL Diffuse Controls",
+        MB_OK | MB_ICONINFORMATION);
+}
+
+bool Renderer::AreAnyPointLightsEnabled() const
+{
+    return std::any_of(
+        m_pointLightEnabled.begin(),
+        m_pointLightEnabled.end(),
+        [](bool enabled)
+        {
+            return enabled;
+        });
+}
+
+void Renderer::ToggleAllPointLights()
+{
+    const bool enableLights = !AreAnyPointLightsEnabled();
+    for (bool& pointLightEnabled : m_pointLightEnabled)
+    {
+        pointLightEnabled = enableLights;
+    }
+}
+
+HRESULT Renderer::CycleHdriSelection(int direction)
+{
+    RefreshAvailableHdriFiles();
+    if (m_availableHdriFiles.empty())
+    {
+        m_loadedHdriFileName = L"Missing HDRI";
+        UpdateWindowTitle();
+        return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    }
+
+    if (m_availableHdriFiles.size() == 1)
+    {
+        UpdateWindowTitle();
+        return S_FALSE;
+    }
+
+    const size_t previousIndex = m_currentHdriFileIndex;
+    const int hdriCount = static_cast<int>(m_availableHdriFiles.size());
+    int nextIndex = static_cast<int>(m_currentHdriFileIndex) + direction;
+    nextIndex %= hdriCount;
+    if (nextIndex < 0)
+    {
+        nextIndex += hdriCount;
+    }
+
+    m_currentHdriFileIndex = static_cast<size_t>(nextIndex);
+    HRESULT hr = CreateEnvironmentCubemap(m_availableHdriFiles[m_currentHdriFileIndex]);
+    if (SUCCEEDED(hr))
+    {
+        return S_OK;
+    }
+
+    m_currentHdriFileIndex = previousIndex;
+    if (previousIndex < m_availableHdriFiles.size())
+    {
+        CreateEnvironmentCubemap(m_availableHdriFiles[previousIndex]);
+    }
+
+    return hr;
+}
+
 void Renderer::UpdateWindowTitle()
 {
     if (m_hwnd == nullptr)
@@ -1233,18 +1451,40 @@ void Renderer::UpdateWindowTitle()
     case DisplayMode::DirectLighting:
         modeName = L"Direct";
         break;
+    case DisplayMode::AmbientDiffuse:
+        modeName = L"Ambient IBL";
+        break;
     case DisplayMode::Pbr:
     default:
         modeName = L"PBR";
         break;
     }
 
+    const std::wstring light1State = m_pointLightEnabled[0] ? L"On" : L"Off";
+    const std::wstring light2State = m_pointLightEnabled[1] ? L"On" : L"Off";
+    const std::wstring light3State = m_pointLightEnabled[2] ? L"On" : L"Off";
+    const std::wstring skyPreviewMode = m_previewIrradianceCubemap ? L"Irradiance" : L"Environment";
+    const std::wstring hdriIndexStatus =
+        m_availableHdriFiles.empty()
+        ? std::wstring(L"0/0")
+        : (std::to_wstring(m_currentHdriFileIndex + 1) + L"/" + std::to_wstring(m_availableHdriFiles.size()));
+    const std::wstring lightStatus =
+        std::wstring(L" [1 ") + light1State +
+        L" | 2 " + light2State +
+        L" | 3 " + light3State +
+        L"]";
+
     const std::wstring title =
         m_title +
-        L" | 1 PBR | 2 NDF | 3 Geometry | 4 Fresnel | 5 Direct lights | L toggle point lights | Debug modes use analytic preview | Roughness: left->right | Metalness: front->back | HDRI: " +
+        L" | 1 PBR | 2 NDF | 3 Geometry | 4 Fresnel | 5 Direct | 6 Ambient IBL | Left/Right HDRI | I sky preview | L all lights | 7/8/9 lights | Roughness: left->right | Metalness: front->back | HDRI " +
+        hdriIndexStatus +
+        L": " +
         m_loadedHdriFileName +
-        L" | Lights " +
-        std::wstring(m_pointLightsEnabled ? L"On" : L"Off") +
+        L" | Sky " +
+        skyPreviewMode +
+        L" | Lights any " +
+        std::wstring(AreAnyPointLightsEnabled() ? L"On" : L"Off") +
+        lightStatus +
         L" | Mode " +
         std::wstring(modeName);
 
@@ -1311,7 +1551,12 @@ void Renderer::RenderEnvironment()
     ID3D11SamplerState* samplers[] = { m_linearClampSampler.Get() };
     m_deviceContext->PSSetSamplers(0, 1, samplers);
 
-    ID3D11ShaderResourceView* shaderResources[] = { m_environmentCubemapShaderResourceView.Get() };
+    ID3D11ShaderResourceView* shaderResources[] =
+    {
+        m_previewIrradianceCubemap
+            ? m_irradianceCubemapShaderResourceView.Get()
+            : m_environmentCubemapShaderResourceView.Get()
+    };
     m_deviceContext->PSSetShaderResources(0, 1, shaderResources);
     m_deviceContext->DrawIndexed(m_environmentSphereGeometry.indexCount, 0, 0);
 
@@ -1335,7 +1580,7 @@ void Renderer::RenderSpheres()
         sceneFrameConstants.pointLights[lightIndex].positionRadius =
             XMFLOAT4(light.position.x, light.position.y, light.position.z, light.radius);
         sceneFrameConstants.pointLights[lightIndex].colorIntensity =
-            XMFLOAT4(light.color.x, light.color.y, light.color.z, m_pointLightsEnabled ? light.intensity : 0.0f);
+            XMFLOAT4(light.color.x, light.color.y, light.color.z, m_pointLightEnabled[lightIndex] ? light.intensity : 0.0f);
     }
 
     sceneFrameConstants.globalParameters =
@@ -1372,7 +1617,7 @@ void Renderer::RenderSpheres()
 
     for (size_t lightIndex = 0; lightIndex < m_pointLights.size(); ++lightIndex)
     {
-        if (m_displayMode != DisplayMode::Pbr || !m_pointLightsEnabled)
+        if (m_displayMode != DisplayMode::Pbr || !m_pointLightEnabled[lightIndex])
         {
             continue;
         }
@@ -1585,45 +1830,6 @@ void Renderer::EndEvent() const
     }
 }
 
-fs::path Renderer::FindHdriFile() const
-{
-    const fs::path executableDirectory = GetExecutableDirectory();
-
-    std::error_code errorCode;
-    const fs::path currentDirectory = fs::current_path(errorCode);
-
-    std::vector<fs::path> searchDirectories;
-    searchDirectories.emplace_back(executableDirectory / L"assets" / L"hdri");
-
-    if (!currentDirectory.empty())
-    {
-        searchDirectories.emplace_back(currentDirectory / L"assets" / L"hdri");
-        searchDirectories.emplace_back(currentDirectory / L"ibl-diffuse" / L"assets" / L"hdri");
-    }
-
-    const fs::path twoLevelsUp = executableDirectory.parent_path().parent_path();
-    if (!twoLevelsUp.empty())
-    {
-        searchDirectories.emplace_back(twoLevelsUp / L"assets" / L"hdri");
-        searchDirectories.emplace_back(twoLevelsUp / L"ibl-diffuse" / L"assets" / L"hdri");
-    }
-
-    std::vector<fs::path> candidateFiles;
-    for (const fs::path& directory : searchDirectories)
-    {
-        AppendHdrFilesFromDirectory(directory, candidateFiles);
-    }
-
-    if (candidateFiles.empty())
-    {
-        return {};
-    }
-
-    std::sort(candidateFiles.begin(), candidateFiles.end());
-    candidateFiles.erase(std::unique(candidateFiles.begin(), candidateFiles.end()), candidateFiles.end());
-    return candidateFiles.front();
-}
-
 void Renderer::Render()
 {
     if (m_isMinimized || m_width == 0 || m_height == 0)
@@ -1803,13 +2009,67 @@ LRESULT Renderer::HandleWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LP
             m_displayMode = DisplayMode::DirectLighting;
             UpdateWindowTitle();
         }
+        else if (wParam == '6')
+        {
+            m_displayMode = DisplayMode::AmbientDiffuse;
+            UpdateWindowTitle();
+        }
         else if (wParam == 'R')
         {
             ResetCamera();
         }
+        else if (wParam == VK_LEFT)
+        {
+            const HRESULT hr = CycleHdriSelection(-1);
+            if (FAILED(hr))
+            {
+                MessageBoxW(
+                    hwnd,
+                    L"Failed to rebuild the environment and irradiance cubemaps for the selected HDRI.",
+                    L"HDRI Switch Failed",
+                    MB_OK | MB_ICONERROR);
+            }
+        }
+        else if (wParam == VK_RIGHT)
+        {
+            const HRESULT hr = CycleHdriSelection(1);
+            if (FAILED(hr))
+            {
+                MessageBoxW(
+                    hwnd,
+                    L"Failed to rebuild the environment and irradiance cubemaps for the selected HDRI.",
+                    L"HDRI Switch Failed",
+                    MB_OK | MB_ICONERROR);
+            }
+        }
+        else if (wParam == 'I')
+        {
+            m_previewIrradianceCubemap = !m_previewIrradianceCubemap;
+            UpdateWindowTitle();
+        }
         else if (wParam == 'L')
         {
-            m_pointLightsEnabled = !m_pointLightsEnabled;
+            ToggleAllPointLights();
+            UpdateWindowTitle();
+        }
+        else if (wParam == '7')
+        {
+            m_pointLightEnabled[0] = !m_pointLightEnabled[0];
+            UpdateWindowTitle();
+        }
+        else if (wParam == '8')
+        {
+            m_pointLightEnabled[1] = !m_pointLightEnabled[1];
+            UpdateWindowTitle();
+        }
+        else if (wParam == '9')
+        {
+            m_pointLightEnabled[2] = !m_pointLightEnabled[2];
+            UpdateWindowTitle();
+        }
+        else if (wParam == VK_F1)
+        {
+            ShowControls();
             UpdateWindowTitle();
         }
         return 0;

@@ -1,6 +1,6 @@
 static const float kPi = 3.14159265f;
-static const float kDirectDiffuseBoost = 6.0f;
-static const float kDirectSpecularBoost = 0.0f;
+static const float kDirectDiffuseBoost = 1.0f;
+static const float kDirectSpecularBoost = 1.0f;
 
 struct PointLightData
 {
@@ -220,7 +220,16 @@ float4 PS(PSInput input) : SV_Target
     const float3 ambient = kDambient * ambientDiffuse * max(globalParameters.y, 0.0f);
 
     const float exposure = 1.2f;
-    const float3 finalColor = (displayMode == 4) ? radianceSum : (ambient + radianceSum);
+    float3 finalColor = ambient + radianceSum;
+    if (displayMode == 4)
+    {
+        finalColor = radianceSum;
+    }
+    else if (displayMode == 5)
+    {
+        finalColor = ambient;
+    }
+
     const float3 toneMappedColor = ToneMapReinhard(max(finalColor * exposure, 0.0f.xxx));
     const float3 gammaCorrectedColor = pow(clamp(toneMappedColor, 0.0f.xxx, 1.0f.xxx), 1.0f / 2.2f);
     return float4(gammaCorrectedColor, 1.0f);
