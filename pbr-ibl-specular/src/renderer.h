@@ -7,6 +7,7 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <chrono>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -40,6 +41,10 @@ private:
         Geometry = 2,
         Fresnel = 3,
         DirectLighting = 4,
+        DiffuseIbl = 5,
+        SpecularIbl = 6,
+        AmbientIbl = 7,
+        Reflection = 8,
     };
 
     struct PointLight
@@ -99,6 +104,7 @@ private:
         DirectX::XMFLOAT4 faceForward;
         DirectX::XMFLOAT4 faceRight;
         DirectX::XMFLOAT4 faceUp;
+        DirectX::XMFLOAT4 prefilterParameters;
     };
 
 private:
@@ -126,10 +132,27 @@ private:
     HRESULT RenderCubemapFaces(
         ID3D11Texture2D* targetTexture,
         UINT faceSize,
+        UINT mipLevel,
+        float roughness,
+        float sourceCubemapFaceSize,
         ID3D11PixelShader* pixelShader,
         ID3D11ShaderResourceView* sourceShaderResourceView,
         const wchar_t* eventName);
     HRESULT CreateIrradianceMap();
+    HRESULT CreatePrefilteredEnvironmentMap();
+    HRESULT CreateBrdfIntegrationMap();
+    HRESULT CreateFloatTexture2D(
+        UINT width,
+        UINT height,
+        Microsoft::WRL::ComPtr<ID3D11Texture2D>& texture,
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>& shaderResourceView,
+        const char* debugNamePrefix);
+    HRESULT RenderFullscreenTexture(
+        ID3D11Texture2D* targetTexture,
+        UINT width,
+        UINT height,
+        ID3D11PixelShader* pixelShader,
+        const wchar_t* eventName);
     void CreateSceneObjects();
     void InitializeLights();
     void UpdateWindowTitle();
@@ -142,6 +165,7 @@ private:
     void ResizeSwapChain(UINT width, UINT height);
 
     // Camera and rendering
+    void Update(float deltaTime);
     void ResetCamera();
     void UpdateCamera();
     void RenderEnvironment();
@@ -173,9 +197,13 @@ private:
     bool m_isMinimized;
     std::wstring m_title;
 
-    // Input and camera
+    // Timing and input
+    std::chrono::steady_clock::time_point m_previousFrameTime;
+    std::array<bool, 256> m_keyStates;
     bool m_isOrbiting;
     POINT m_lastMousePosition;
+
+    // Camera
     DirectX::XMFLOAT3 m_cameraTarget;
     float m_cameraDistance;
     float m_cameraYaw;
@@ -189,6 +217,7 @@ private:
     std::array<PointLight, 3> m_pointLights;
     DisplayMode m_displayMode;
     bool m_pointLightsEnabled;
+    bool m_specularIblEnabled;
     std::wstring m_loadedHdriFileName;
 
     // DirectX core objects
@@ -214,8 +243,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D11VertexShader> m_skyVertexShader;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_skyPixelShader;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> m_captureVertexShader;
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> m_fullscreenVertexShader;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_equirectangularToCubemapPixelShader;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_irradianceConvolutionPixelShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_prefilterEnvironmentPixelShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_brdfIntegrationPixelShader;
     Microsoft::WRL::ComPtr<ID3D11InputLayout> m_sceneInputLayout;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> m_linearClampSampler;
 
@@ -232,6 +264,10 @@ private:
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_environmentCubemapShaderResourceView;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_irradianceCubemap;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_irradianceCubemapShaderResourceView;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_prefilteredEnvironmentCubemap;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_prefilteredEnvironmentCubemapShaderResourceView;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_brdfIntegrationTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_brdfIntegrationShaderResourceView;
 
     // Debug layer state
     bool m_debugLayerEnabled;

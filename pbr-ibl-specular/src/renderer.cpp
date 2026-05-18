@@ -34,12 +34,16 @@ namespace
     constexpr UINT kEnvironmentCubemapSize = 1024;
     constexpr UINT kEnvironmentCubemapMipLevels = 11;
     constexpr UINT kIrradianceCubemapSize = 32;
+    constexpr UINT kPrefilteredEnvironmentCubemapSize = 128;
+    constexpr UINT kPrefilteredEnvironmentCubemapMipLevels = 5;
+    constexpr UINT kBrdfIntegrationMapSize = 512;
     constexpr UINT kSphereGridWidth = 6;
     constexpr UINT kSphereGridHeight = 6;
     constexpr float kSphereGridSpacing = 2.35f;
     constexpr float kSphereScale = 0.78f;
     constexpr float kEnvironmentSphereScale = 80.0f;
-    constexpr float kEnvironmentIntensity = 0.08f;
+    constexpr float kEnvironmentIntensity = 1.0f;
+    constexpr float kMaxReflectionLod = static_cast<float>(kPrefilteredEnvironmentCubemapMipLevels - 1u);
 
     struct CubemapCaptureFace
     {
@@ -196,7 +200,9 @@ Renderer::Renderer() :
     m_width(1400),
     m_height(900),
     m_isMinimized(false),
-    m_title(L"IBL Diffuse"),
+    m_title(L"IBL Diffuse + Specular"),
+    m_previousFrameTime(std::chrono::steady_clock::now()),
+    m_keyStates{},
     m_isOrbiting(false),
     m_lastMousePosition{},
     m_cameraTarget(0.0f, 0.0f, 0.0f),
@@ -206,6 +212,7 @@ Renderer::Renderer() :
     m_cameraPosition(0.0f, 0.0f, 0.0f),
     m_displayMode(DisplayMode::Pbr),
     m_pointLightsEnabled(true),
+    m_specularIblEnabled(true),
     m_loadedHdriFileName(L"No HDRI"),
     m_debugLayerEnabled(false)
 {
@@ -244,6 +251,7 @@ HRESULT Renderer::Initialize(HINSTANCE hInstance, int nCmdShow)
     CreateSceneObjects();
     InitializeLights();
     ResetCamera();
+    m_previousFrameTime = std::chrono::steady_clock::now();
     UpdateWindowTitle();
 
     ShowWindow(m_hwnd, nCmdShow);
@@ -580,7 +588,9 @@ HRESULT Renderer::CreatePipelineStates()
 {
     D3D11_RASTERIZER_DESC rasterizerDesc = {};
     rasterizerDesc.FillMode = D3D11_FILL_SOLID;
-    rasterizerDesc.CullMode = D3D11_CULL_BACK;
+    // The generated sphere mesh uses the opposite winding from D3D's default
+    // front-face convention, so we keep both sides to shade the visible shell.
+    rasterizerDesc.CullMode = D3D11_CULL_NONE;
     rasterizerDesc.DepthClipEnable = TRUE;
 
     HRESULT hr = m_device->CreateRasterizerState(&rasterizerDesc, m_rasterizerState.ReleaseAndGetAddressOf());
@@ -806,6 +816,28 @@ HRESULT Renderer::CreateShaders()
         return hr;
     }
 
+    ComPtr<ID3DBlob> fullscreenVertexShaderBlob;
+    hr = LoadShaderBlob(
+        L"fullscreen_vertex_shader.cso",
+        L"src\\shaders\\fullscreen_vertex_shader.hlsl",
+        "VS",
+        "vs_5_0",
+        fullscreenVertexShaderBlob.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = m_device->CreateVertexShader(
+        fullscreenVertexShaderBlob->GetBufferPointer(),
+        fullscreenVertexShaderBlob->GetBufferSize(),
+        nullptr,
+        m_fullscreenVertexShader.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
     hr = createPixelShader(
         L"equirectangular_to_cubemap_pixel_shader.cso",
         L"src\\shaders\\equirectangular_to_cubemap_pixel_shader.hlsl",
@@ -826,9 +858,30 @@ HRESULT Renderer::CreateShaders()
         return hr;
     }
 
+    hr = createPixelShader(
+        L"prefilter_environment_pixel_shader.cso",
+        L"src\\shaders\\prefilter_environment_pixel_shader.hlsl",
+        "IBLSpecularPrefilterEnvironmentPixelShader",
+        m_prefilterEnvironmentPixelShader.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = createPixelShader(
+        L"brdf_integration_pixel_shader.cso",
+        L"src\\shaders\\brdf_integration_pixel_shader.hlsl",
+        "IBLSpecularBrdfIntegrationPixelShader",
+        m_brdfIntegrationPixelShader.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
     SetDebugName(m_pbrSceneVertexShader.Get(), "PBRSphereSceneVertexShader");
     SetDebugName(m_skyVertexShader.Get(), "PBRSphereSkyVertexShader");
     SetDebugName(m_captureVertexShader.Get(), "IBLDiffuseCaptureVertexShader");
+    SetDebugName(m_fullscreenVertexShader.Get(), "IBLSpecularFullscreenVertexShader");
     SetDebugName(m_sceneInputLayout.Get(), "PBRSphereInputLayout");
     return S_OK;
 }
@@ -916,6 +969,10 @@ HRESULT Renderer::CreateEnvironmentCubemap()
     m_environmentCubemapShaderResourceView.Reset();
     m_irradianceCubemap.Reset();
     m_irradianceCubemapShaderResourceView.Reset();
+    m_prefilteredEnvironmentCubemap.Reset();
+    m_prefilteredEnvironmentCubemapShaderResourceView.Reset();
+    m_brdfIntegrationTexture.Reset();
+    m_brdfIntegrationShaderResourceView.Reset();
 
     const fs::path hdriFilePath = FindHdriFile();
     if (hdriFilePath.empty())
@@ -953,6 +1010,9 @@ HRESULT Renderer::CreateEnvironmentCubemap()
     hr = RenderCubemapFaces(
         m_environmentCubemap.Get(),
         kEnvironmentCubemapSize,
+        0,
+        0.0f,
+        0.0f,
         m_equirectangularToCubemapPixelShader.Get(),
         m_hdriTextureShaderResourceView.Get(),
         L"HdriToCubemapPass");
@@ -964,6 +1024,18 @@ HRESULT Renderer::CreateEnvironmentCubemap()
     m_deviceContext->GenerateMips(m_environmentCubemapShaderResourceView.Get());
 
     hr = CreateIrradianceMap();
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = CreatePrefilteredEnvironmentMap();
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    hr = CreateBrdfIntegrationMap();
     if (FAILED(hr))
     {
         return hr;
@@ -1068,6 +1140,9 @@ HRESULT Renderer::CreateFloatCubemap(
 HRESULT Renderer::RenderCubemapFaces(
     ID3D11Texture2D* targetTexture,
     UINT faceSize,
+    UINT mipLevel,
+    float roughness,
+    float sourceCubemapFaceSize,
     ID3D11PixelShader* pixelShader,
     ID3D11ShaderResourceView* sourceShaderResourceView,
     const wchar_t* eventName)
@@ -1083,7 +1158,7 @@ HRESULT Renderer::RenderCubemapFaces(
         D3D11_RENDER_TARGET_VIEW_DESC renderTargetViewDesc = {};
         renderTargetViewDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         renderTargetViewDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
-        renderTargetViewDesc.Texture2DArray.MipSlice = 0;
+        renderTargetViewDesc.Texture2DArray.MipSlice = mipLevel;
         renderTargetViewDesc.Texture2DArray.FirstArraySlice = faceIndex;
         renderTargetViewDesc.Texture2DArray.ArraySize = 1;
 
@@ -1115,6 +1190,7 @@ HRESULT Renderer::RenderCubemapFaces(
 
     ID3D11Buffer* captureBuffers[] = { m_captureConstantBuffer.Get() };
     m_deviceContext->VSSetConstantBuffers(0, 1, captureBuffers);
+    m_deviceContext->PSSetConstantBuffers(0, 1, captureBuffers);
 
     ID3D11SamplerState* samplers[] = { m_linearClampSampler.Get() };
     m_deviceContext->PSSetSamplers(0, 1, samplers);
@@ -1131,6 +1207,7 @@ HRESULT Renderer::RenderCubemapFaces(
         captureConstants.faceForward = XMFLOAT4(face.forward.x, face.forward.y, face.forward.z, 0.0f);
         captureConstants.faceRight = XMFLOAT4(face.right.x, face.right.y, face.right.z, 0.0f);
         captureConstants.faceUp = XMFLOAT4(face.up.x, face.up.y, face.up.z, 0.0f);
+        captureConstants.prefilterParameters = XMFLOAT4(roughness, sourceCubemapFaceSize, 0.0f, 0.0f);
         UpdateConstantBuffer(m_deviceContext.Get(), m_captureConstantBuffer, captureConstants);
 
         ID3D11RenderTargetView* renderTargets[] = { faceRenderTargetViews[faceIndex].Get() };
@@ -1164,9 +1241,165 @@ HRESULT Renderer::CreateIrradianceMap()
     return RenderCubemapFaces(
         m_irradianceCubemap.Get(),
         kIrradianceCubemapSize,
+        0,
+        0.0f,
+        0.0f,
         m_irradianceConvolutionPixelShader.Get(),
         m_environmentCubemapShaderResourceView.Get(),
         L"IrradianceConvolutionPass");
+}
+
+HRESULT Renderer::CreatePrefilteredEnvironmentMap()
+{
+    HRESULT hr = CreateFloatCubemap(
+        kPrefilteredEnvironmentCubemapSize,
+        kPrefilteredEnvironmentCubemapMipLevels,
+        false,
+        m_prefilteredEnvironmentCubemap,
+        m_prefilteredEnvironmentCubemapShaderResourceView,
+        "IBLSpecularPrefilteredEnvironmentCubemap");
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    for (UINT mipLevel = 0; mipLevel < kPrefilteredEnvironmentCubemapMipLevels; ++mipLevel)
+    {
+        const UINT mipFaceSize = std::max(kPrefilteredEnvironmentCubemapSize >> mipLevel, 1u);
+        const float roughness =
+            (kPrefilteredEnvironmentCubemapMipLevels > 1)
+            ? (static_cast<float>(mipLevel) / static_cast<float>(kPrefilteredEnvironmentCubemapMipLevels - 1u))
+            : 0.0f;
+
+        hr = RenderCubemapFaces(
+            m_prefilteredEnvironmentCubemap.Get(),
+            mipFaceSize,
+            mipLevel,
+            roughness,
+            static_cast<float>(kEnvironmentCubemapSize),
+            m_prefilterEnvironmentPixelShader.Get(),
+            m_environmentCubemapShaderResourceView.Get(),
+            L"PrefilterEnvironmentPass");
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+    }
+
+    return S_OK;
+}
+
+HRESULT Renderer::CreateFloatTexture2D(
+    UINT width,
+    UINT height,
+    ComPtr<ID3D11Texture2D>& texture,
+    ComPtr<ID3D11ShaderResourceView>& shaderResourceView,
+    const char* debugNamePrefix)
+{
+    D3D11_TEXTURE2D_DESC textureDesc = {};
+    textureDesc.Width = width;
+    textureDesc.Height = height;
+    textureDesc.MipLevels = 1;
+    textureDesc.ArraySize = 1;
+    textureDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    textureDesc.SampleDesc.Count = 1;
+    textureDesc.Usage = D3D11_USAGE_DEFAULT;
+    textureDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+    HRESULT hr = m_device->CreateTexture2D(&textureDesc, nullptr, texture.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC shaderResourceViewDesc = {};
+    shaderResourceViewDesc.Format = textureDesc.Format;
+    shaderResourceViewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    shaderResourceViewDesc.Texture2D.MostDetailedMip = 0;
+    shaderResourceViewDesc.Texture2D.MipLevels = 1;
+
+    hr = m_device->CreateShaderResourceView(
+        texture.Get(),
+        &shaderResourceViewDesc,
+        shaderResourceView.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    SetDebugName(texture.Get(), std::string(debugNamePrefix));
+    SetDebugName(shaderResourceView.Get(), std::string(debugNamePrefix) + ".SRV");
+    return S_OK;
+}
+
+HRESULT Renderer::RenderFullscreenTexture(
+    ID3D11Texture2D* targetTexture,
+    UINT width,
+    UINT height,
+    ID3D11PixelShader* pixelShader,
+    const wchar_t* eventName)
+{
+    if (targetTexture == nullptr || pixelShader == nullptr)
+    {
+        return E_POINTER;
+    }
+
+    ComPtr<ID3D11RenderTargetView> renderTargetView;
+    HRESULT hr = m_device->CreateRenderTargetView(
+        targetTexture,
+        nullptr,
+        renderTargetView.ReleaseAndGetAddressOf());
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    BeginEvent(eventName);
+
+    D3D11_VIEWPORT viewport = {};
+    viewport.Width = static_cast<FLOAT>(width);
+    viewport.Height = static_cast<FLOAT>(height);
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+    m_deviceContext->RSSetViewports(1, &viewport);
+
+    m_deviceContext->IASetInputLayout(nullptr);
+    m_deviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_deviceContext->RSSetState(m_rasterizerState.Get());
+    m_deviceContext->OMSetDepthStencilState(m_skyDepthStencilState.Get(), 0);
+    m_deviceContext->VSSetShader(m_fullscreenVertexShader.Get(), nullptr, 0);
+    m_deviceContext->PSSetShader(pixelShader, nullptr, 0);
+
+    const float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    ID3D11RenderTargetView* renderTargets[] = { renderTargetView.Get() };
+    m_deviceContext->OMSetRenderTargets(1, renderTargets, nullptr);
+    m_deviceContext->ClearRenderTargetView(renderTargetView.Get(), clearColor);
+    m_deviceContext->Draw(3, 0);
+    m_deviceContext->OMSetRenderTargets(0, nullptr, nullptr);
+
+    EndEvent();
+    return S_OK;
+}
+
+HRESULT Renderer::CreateBrdfIntegrationMap()
+{
+    HRESULT hr = CreateFloatTexture2D(
+        kBrdfIntegrationMapSize,
+        kBrdfIntegrationMapSize,
+        m_brdfIntegrationTexture,
+        m_brdfIntegrationShaderResourceView,
+        "IBLSpecularBrdfIntegrationMap");
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    return RenderFullscreenTexture(
+        m_brdfIntegrationTexture.Get(),
+        kBrdfIntegrationMapSize,
+        kBrdfIntegrationMapSize,
+        m_brdfIntegrationPixelShader.Get(),
+        L"BrdfIntegrationPass");
 }
 
 void Renderer::CreateSceneObjects()
@@ -1231,6 +1464,18 @@ void Renderer::UpdateWindowTitle()
     case DisplayMode::DirectLighting:
         modeName = L"Direct";
         break;
+    case DisplayMode::DiffuseIbl:
+        modeName = L"Diffuse IBL";
+        break;
+    case DisplayMode::SpecularIbl:
+        modeName = L"Specular IBL";
+        break;
+    case DisplayMode::AmbientIbl:
+        modeName = L"Ambient IBL";
+        break;
+    case DisplayMode::Reflection:
+        modeName = L"Reflection";
+        break;
     case DisplayMode::Pbr:
     default:
         modeName = L"PBR";
@@ -1239,14 +1484,69 @@ void Renderer::UpdateWindowTitle()
 
     const std::wstring title =
         m_title +
-        L" | 1 PBR | 2 NDF | 3 Geometry | 4 Fresnel | 5 Direct lights | L toggle point lights | Debug modes use analytic preview | Roughness: left->right | Metalness: front->back | HDRI: " +
+        L" | LMB orbit | Mouse wheel zoom | WASD / Arrows move target | 1 PBR | 2 NDF | 3 Geometry | 4 Fresnel | 5 Direct | 6 Diffuse IBL | 7 Specular IBL | 8 Ambient IBL | 9 Reflection | L lights | I specular IBL | Roughness: left->right | Metalness: front->back | HDRI: " +
         m_loadedHdriFileName +
         L" | Lights " +
         std::wstring(m_pointLightsEnabled ? L"On" : L"Off") +
+        L" | Specular IBL " +
+        std::wstring(m_specularIblEnabled ? L"On" : L"Off") +
         L" | Mode " +
         std::wstring(modeName);
 
     SetWindowTextW(m_hwnd, title.c_str());
+}
+
+void Renderer::Update(float deltaTime)
+{
+    XMVECTOR movementDirection = XMVectorZero();
+    const XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+    const XMVECTOR cameraPosition = XMLoadFloat3(&m_cameraPosition);
+    const XMVECTOR cameraTarget = XMLoadFloat3(&m_cameraTarget);
+
+    XMVECTOR forward = XMVectorSubtract(cameraTarget, cameraPosition);
+    forward = XMVectorSetY(forward, 0.0f);
+
+    if (XMVectorGetX(XMVector3LengthSq(forward)) < 1.0e-6f)
+    {
+        forward = XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f);
+    }
+    else
+    {
+        forward = XMVector3Normalize(forward);
+    }
+
+    const XMVECTOR right = XMVector3Normalize(XMVector3Cross(worldUp, forward));
+
+    if (m_keyStates['W'] || m_keyStates[VK_UP])
+    {
+        movementDirection = XMVectorAdd(movementDirection, forward);
+    }
+
+    if (m_keyStates['S'] || m_keyStates[VK_DOWN])
+    {
+        movementDirection = XMVectorSubtract(movementDirection, forward);
+    }
+
+    if (m_keyStates['D'] || m_keyStates[VK_RIGHT])
+    {
+        movementDirection = XMVectorAdd(movementDirection, right);
+    }
+
+    if (m_keyStates['A'] || m_keyStates[VK_LEFT])
+    {
+        movementDirection = XMVectorSubtract(movementDirection, right);
+    }
+
+    if (XMVectorGetX(XMVector3LengthSq(movementDirection)) > 1.0e-6f)
+    {
+        constexpr float movementSpeed = 5.5f;
+        movementDirection = XMVector3Normalize(movementDirection);
+
+        const XMVECTOR movement = XMVectorScale(movementDirection, movementSpeed * deltaTime);
+        const XMVECTOR updatedTarget = XMVectorAdd(cameraTarget, movement);
+        XMStoreFloat3(&m_cameraTarget, updatedTarget);
+        UpdateCamera();
+    }
 }
 
 void Renderer::ResetCamera()
@@ -1337,7 +1637,11 @@ void Renderer::RenderSpheres()
     }
 
     sceneFrameConstants.globalParameters =
-        XMFLOAT4(static_cast<float>(static_cast<int>(m_displayMode)), kEnvironmentIntensity, 0.0f, 0.0f);
+        XMFLOAT4(
+            static_cast<float>(static_cast<int>(m_displayMode)),
+            kEnvironmentIntensity,
+            kMaxReflectionLod,
+            m_specularIblEnabled ? 1.0f : 0.0f);
     UpdateConstantBuffer(m_deviceContext.Get(), m_sceneFrameConstantBuffer, sceneFrameConstants);
 
     const UINT stride = sizeof(SceneVertex);
@@ -1360,8 +1664,13 @@ void Renderer::RenderSpheres()
     ID3D11SamplerState* samplers[] = { m_linearClampSampler.Get() };
     m_deviceContext->PSSetSamplers(0, 1, samplers);
 
-    ID3D11ShaderResourceView* shaderResources[] = { m_irradianceCubemapShaderResourceView.Get() };
-    m_deviceContext->PSSetShaderResources(0, 1, shaderResources);
+    ID3D11ShaderResourceView* shaderResources[] =
+    {
+        m_irradianceCubemapShaderResourceView.Get(),
+        m_prefilteredEnvironmentCubemapShaderResourceView.Get(),
+        m_brdfIntegrationShaderResourceView.Get(),
+    };
+    m_deviceContext->PSSetShaderResources(0, ARRAYSIZE(shaderResources), shaderResources);
 
     for (const SphereInstance& instance : m_sphereInstances)
     {
@@ -1387,8 +1696,8 @@ void Renderer::RenderSpheres()
         DrawSphereInstance(marker);
     }
 
-    ID3D11ShaderResourceView* nullSrvs[] = { nullptr };
-    m_deviceContext->PSSetShaderResources(0, 1, nullSrvs);
+    ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr, nullptr };
+    m_deviceContext->PSSetShaderResources(0, ARRAYSIZE(nullSrvs), nullSrvs);
 
     EndEvent();
 }
@@ -1630,6 +1939,13 @@ void Renderer::Render()
         return;
     }
 
+    const auto currentTime = std::chrono::steady_clock::now();
+    float deltaTime = std::chrono::duration<float>(currentTime - m_previousFrameTime).count();
+    m_previousFrameTime = currentTime;
+    deltaTime = std::clamp(deltaTime, 0.0001f, 0.1f);
+
+    Update(deltaTime);
+
     BeginEvent(L"Frame");
 
     ID3D11RenderTargetView* renderTargets[] = { m_renderTargetView.Get() };
@@ -1696,13 +2012,20 @@ void Renderer::Cleanup()
     m_skyFrameConstantBuffer.Reset();
     m_sceneInputLayout.Reset();
     m_captureVertexShader.Reset();
+    m_fullscreenVertexShader.Reset();
+    m_brdfIntegrationPixelShader.Reset();
     m_equirectangularToCubemapPixelShader.Reset();
     m_irradianceConvolutionPixelShader.Reset();
+    m_prefilterEnvironmentPixelShader.Reset();
     m_pbrSceneVertexShader.Reset();
     m_pbrScenePixelShader.Reset();
     m_skyVertexShader.Reset();
     m_skyPixelShader.Reset();
     m_linearClampSampler.Reset();
+    m_brdfIntegrationShaderResourceView.Reset();
+    m_brdfIntegrationTexture.Reset();
+    m_prefilteredEnvironmentCubemapShaderResourceView.Reset();
+    m_prefilteredEnvironmentCubemap.Reset();
     m_irradianceCubemapShaderResourceView.Reset();
     m_irradianceCubemap.Reset();
     m_hdriTextureShaderResourceView.Reset();
@@ -1776,6 +2099,11 @@ LRESULT Renderer::HandleWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LP
     }
 
     case WM_KEYDOWN:
+        if (wParam < m_keyStates.size())
+        {
+            m_keyStates[static_cast<size_t>(wParam)] = true;
+        }
+
         if (wParam == '1')
         {
             m_displayMode = DisplayMode::Pbr;
@@ -1801,6 +2129,26 @@ LRESULT Renderer::HandleWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LP
             m_displayMode = DisplayMode::DirectLighting;
             UpdateWindowTitle();
         }
+        else if (wParam == '6')
+        {
+            m_displayMode = DisplayMode::DiffuseIbl;
+            UpdateWindowTitle();
+        }
+        else if (wParam == '7')
+        {
+            m_displayMode = DisplayMode::SpecularIbl;
+            UpdateWindowTitle();
+        }
+        else if (wParam == '8')
+        {
+            m_displayMode = DisplayMode::AmbientIbl;
+            UpdateWindowTitle();
+        }
+        else if (wParam == '9')
+        {
+            m_displayMode = DisplayMode::Reflection;
+            UpdateWindowTitle();
+        }
         else if (wParam == 'R')
         {
             ResetCamera();
@@ -1810,9 +2158,22 @@ LRESULT Renderer::HandleWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LP
             m_pointLightsEnabled = !m_pointLightsEnabled;
             UpdateWindowTitle();
         }
+        else if (wParam == 'I')
+        {
+            m_specularIblEnabled = !m_specularIblEnabled;
+            UpdateWindowTitle();
+        }
+        return 0;
+
+    case WM_KEYUP:
+        if (wParam < m_keyStates.size())
+        {
+            m_keyStates[static_cast<size_t>(wParam)] = false;
+        }
         return 0;
 
     case WM_KILLFOCUS:
+        m_keyStates.fill(false);
         m_isOrbiting = false;
         if (GetCapture() == hwnd)
         {
