@@ -23,7 +23,9 @@ int WINAPI WinMain(
         swprintf_s(
             message,
             L"Failed to initialize IBL diffuse renderer.\n"
-            L"Make sure a Radiance HDR file (*.hdr) exists in ibl-diffuse\\assets\\hdri.\n"
+            L"Make sure at least one Radiance HDR file (*.hdr) exists in:\n"
+            L" - ibl-diffuse\\assets\\hdri\n"
+            L" - or Lab4\\Lab4\\cubemaps\n"
             L"HRESULT: 0x%08X",
             static_cast<unsigned int>(hr));
 
