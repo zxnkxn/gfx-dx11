@@ -1,6 +1,6 @@
 static const float kPi = 3.14159265f;
-static const float kDirectDiffuseBoost = 6.0f;
-static const float kDirectSpecularBoost = 0.0f;
+static const float kDirectDiffuseBoost = 1.0f;
+static const float kDirectSpecularBoost = 1.0f;
 
 struct PointLightData
 {
@@ -100,6 +100,13 @@ float3 ToneMapReinhard(float3 color)
     return color / (1.0f.xxx + color);
 }
 
+float3 EncodeDebugView(float3 hdrColor)
+{
+    const float debugExposure = 1.2f;
+    const float3 toneMappedColor = ToneMapReinhard(max(hdrColor * debugExposure, 0.0f.xxx));
+    return pow(clamp(toneMappedColor, 0.0f.xxx, 1.0f.xxx), 1.0f / 2.2f);
+}
+
 float ComputePointLightAttenuation(float distanceToLight, float radius)
 {
     const float clampedRadius = max(radius, 0.001f);
@@ -135,66 +142,21 @@ float4 PS(PSInput input) : SV_Target
     const float3 dielectricF0 = float3(0.04f, 0.04f, 0.04f);
     const float3 F0 = lerp(dielectricF0, albedoColor, clampedMetalness);
 
-    if (any(emissiveColorLinear > 0.0f))
+    if (displayMode == 3)
     {
-        const float3 emissiveColor = ToneMapReinhard(emissiveColorLinear);
-        const float3 gammaCorrectedEmissive = pow(clamp(emissiveColor, 0.0f.xxx, 1.0f.xxx), 1.0f / 2.2f);
-        return float4(gammaCorrectedEmissive, (alphaMode == 2) ? alpha : 1.0f);
-    }
-
-    if (displayMode != 0 && displayMode != 4)
-    {
-        // Use a stable analytic preview for the BRDF terms so the debug modes
-        // stay readable and are not tied to the scene lighting composition.
-        const float3 debugNormal = N;
-        const float3 debugViewDirection = V;
-        const float3 referenceUp = (abs(debugViewDirection.y) < 0.95f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
-        const float3 debugTangent = SafeNormalize(cross(referenceUp, debugViewDirection), float3(1.0f, 0.0f, 0.0f));
-        const float3 debugBitangent = SafeNormalize(cross(debugViewDirection, debugTangent), float3(0.0f, 1.0f, 0.0f));
-
-        const float debugNdotV = clamp(dot(debugNormal, debugViewDirection), 0.0f, 1.0f);
-
-        const float3 debugNdfLightDirection =
-            SafeNormalize(debugViewDirection * 0.80f - debugTangent * 0.52f + debugBitangent * 0.30f, debugViewDirection);
-        const float3 debugNdfHalfVector = SafeNormalize(debugViewDirection + debugNdfLightDirection, debugViewDirection);
-        const float debugNdfNdotH = clamp(dot(debugNormal, debugNdfHalfVector), 0.0f, 1.0f);
-        const float debugDistribution = DistributionGGX(debugNdfNdotH, clampedRoughness);
-
-        const float3 debugGeometryLightDirection =
-            SafeNormalize(debugViewDirection * 0.32f - debugTangent * 0.88f + debugBitangent * 0.18f, debugViewDirection);
-        const float debugGeometryNdotL = clamp(dot(debugNormal, debugGeometryLightDirection), 0.0f, 1.0f);
-        const float debugGeometry = GeometrySmith(debugNdotV, debugGeometryNdotL, clampedRoughness);
-
-        const float3 debugFresnelLightDirection =
-            SafeNormalize(-debugViewDirection * 0.45f - debugTangent * 0.82f + debugBitangent * 0.35f, -debugViewDirection);
-        const float3 debugFresnelHalfVector = SafeNormalize(debugViewDirection + debugFresnelLightDirection, debugViewDirection);
-        const float debugFresnelHdotV = clamp(dot(debugFresnelHalfVector, debugViewDirection), 0.0f, 1.0f);
-        const float3 debugF0 = lerp(float3(0.03f, 0.14f, 0.72f), albedoColor, clampedMetalness);
-        const float3 debugFresnel = FresnelSchlick(debugFresnelHdotV, debugF0);
-
-        if (displayMode == 1)
-        {
-            const float distributionValue =
-                pow(clamp(log2(1.0f + debugDistribution * 96.0f) / 7.0f, 0.0f, 1.0f), 0.42f);
-            const float3 debugColor = pow(lerp(0.08f.xxx, 1.0f.xxx, distributionValue), 1.0f / 2.2f);
-            return float4(debugColor, (alphaMode == 2) ? alpha : 1.0f);
-        }
-
-        if (displayMode == 2)
-        {
-            const float geometryValue = pow(clamp(debugGeometry, 0.0f, 1.0f), 0.55f);
-            const float3 debugColor = pow(lerp(0.08f.xxx, 1.0f.xxx, geometryValue), 1.0f / 2.2f);
-            return float4(debugColor, (alphaMode == 2) ? alpha : 1.0f);
-        }
-
-        const float3 debugColor = pow(clamp(debugFresnel, 0.0f.xxx, 1.0f.xxx), 1.0f / 2.2f);
+        float3 debugColor = 0.0f.xxx;
+        const float debugNdotV = clamp(dot(N, V), 0.0f, 1.0f);
+        const float3 debugFresnel = FresnelSchlick(debugNdotV, F0);
+        const float fresnelValue =
+            pow(dot(clamp(debugFresnel, 0.0f.xxx, 1.0f.xxx), float3(0.2126f, 0.7152f, 0.0722f)), 0.75f);
+        debugColor = pow(lerp(0.06f.xxx, 1.0f.xxx, fresnelValue), 1.0f / 2.2f);
         return float4(debugColor, (alphaMode == 2) ? alpha : 1.0f);
     }
 
     float3 radianceSum = 0.0f.xxx;
-    float accumulatedDistribution = 0.0f;
-    float accumulatedGeometry = 0.0f;
-    float3 accumulatedFresnel = 0.0f.xxx;
+    float debugDistributionSum = 0.0f;
+    float debugGeometrySum = 0.0f;
+    float debugWeightSum = 0.0f;
 
     [unroll]
     for (int lightIndex = 0; lightIndex < 3; ++lightIndex)
@@ -213,17 +175,36 @@ float4 PS(PSInput input) : SV_Target
             continue;
         }
 
+        const float attenuation = ComputePointLightAttenuation(distanceToLight, pointLights[lightIndex].positionRadius.w);
+        const float3 pointRadiance =
+            pointLights[lightIndex].colorIntensity.rgb *
+            pointLights[lightIndex].colorIntensity.w *
+            attenuation;
+        const float debugRadiance = pointLights[lightIndex].colorIntensity.w * attenuation;
+
         const float NdotH = clamp(dot(N, H), 0.0f, 1.0f);
         const float HdotV = clamp(dot(H, V), 0.0f, 1.0f);
 
-        const float directLightRoughness = 1.0f;
-        const float D = DistributionGGX(NdotH, directLightRoughness);
-        const float G = GeometrySmith(NdotV, NdotL, directLightRoughness);
+        const float debugRoughness = clamp(materialParameters.x, 0.045f, 1.0f);
+        const float Ddebug = DistributionGGX(NdotH, debugRoughness);
+        const float Gdebug = GeometrySmith(NdotV, NdotL, debugRoughness);
+        const float D = DistributionGGX(NdotH, clampedRoughness);
+        const float G = GeometrySmith(NdotV, NdotL, clampedRoughness);
         const float3 F = FresnelSchlick(HdotV, F0);
 
-        accumulatedDistribution = max(accumulatedDistribution, D);
-        accumulatedGeometry = max(accumulatedGeometry, G);
-        accumulatedFresnel = max(accumulatedFresnel, F);
+        if (displayMode == 1)
+        {
+            debugDistributionSum += Ddebug * debugRadiance * NdotL;
+            debugWeightSum += debugRadiance * NdotL;
+            continue;
+        }
+
+        if (displayMode == 2)
+        {
+            debugGeometrySum += Gdebug * debugRadiance * NdotL;
+            debugWeightSum += debugRadiance * NdotL;
+            continue;
+        }
 
         const float3 numerator = D * G * F;
         const float denominator = max(4.0f * NdotV * NdotL, 1.0e-4f);
@@ -232,18 +213,21 @@ float4 PS(PSInput input) : SV_Target
         const float3 kS = F;
         const float3 kD = (1.0f.xxx - kS) * (1.0f - clampedMetalness);
 
-        const float attenuation = ComputePointLightAttenuation(distanceToLight, pointLights[lightIndex].positionRadius.w);
-        const float3 pointRadiance =
-            pointLights[lightIndex].colorIntensity.rgb *
-            pointLights[lightIndex].colorIntensity.w *
-            attenuation;
-
         const float3 directDiffuse = kD * albedoColor / kPi;
         const float3 directSpecular = specular;
         radianceSum +=
             (directDiffuse * kDirectDiffuseBoost + directSpecular * kDirectSpecularBoost) *
             pointRadiance *
             NdotL;
+    }
+
+    if (displayMode == 1 || displayMode == 2)
+    {
+        const float debugValue = (debugWeightSum > 1.0e-5f)
+            ? ((displayMode == 1) ? (debugDistributionSum / debugWeightSum) : (debugGeometrySum / debugWeightSum))
+            : 0.0f;
+        const float3 debugColor = EncodeDebugView(debugValue.xxx);
+        return float4(debugColor, (alphaMode == 2) ? alpha : 1.0f);
     }
 
     const float NdotV = clamp(dot(N, V), 0.0f, 1.0f);
@@ -268,7 +252,8 @@ float4 PS(PSInput input) : SV_Target
     const float3 ambient = (kDambient * ambientDiffuse + ambientSpecular) * max(globalParameters.y, 0.0f);
 
     const float exposure = 1.2f;
-    const float3 finalColor = ((displayMode == 4) ? radianceSum : (ambient + radianceSum)) * ambientOcclusion;
+    const float3 litColor = ((displayMode == 4) ? radianceSum : (ambient + radianceSum)) * ambientOcclusion;
+    const float3 finalColor = litColor + emissiveColorLinear;
     const float3 toneMappedColor = ToneMapReinhard(max(finalColor * exposure, 0.0f.xxx));
     const float3 gammaCorrectedColor = pow(clamp(toneMappedColor, 0.0f.xxx, 1.0f.xxx), 1.0f / 2.2f);
     return float4(gammaCorrectedColor, (alphaMode == 2) ? alpha : 1.0f);

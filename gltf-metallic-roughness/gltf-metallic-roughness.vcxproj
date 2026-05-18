@@ -312,13 +312,9 @@
     </FxCompile>
   </ItemGroup>
   <ItemGroup>
-    <None Include="assets\hdri\*.hdr">
+    <None Include="assets\**\*.*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Include="assets\models\*.glb">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-    <None Include="assets\hdri\PLACE_HDRI_HERE.txt" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

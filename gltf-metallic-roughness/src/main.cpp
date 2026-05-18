@@ -33,8 +33,8 @@ int WINAPI WinMain(
         else
         {
             message +=
-                L"Make sure a Radiance HDR file (*.hdr) exists in ibl-diffuse\\assets\\hdri\n"
-                L"and a glTF 2.0 model (*.gltf or *.glb) exists in ibl-diffuse\\assets\\models.\n";
+                L"Make sure a Radiance HDR file (*.hdr) exists in gltf-metallic-roughness\\assets\\hdri\n"
+                L"and a glTF 2.0 model (*.gltf or *.glb) exists in gltf-metallic-roughness\\assets\\models.\n";
         }
 
         wchar_t hrText[32] = {};

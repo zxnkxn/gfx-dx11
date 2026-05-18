@@ -11,7 +11,7 @@ DirectX 11 application that loads a glTF 2.0 model and renders it with HDRI-base
 - Loads embedded or external glTF textures for base color, metallic-roughness, emissive, and occlusion inputs
 - Builds the environment cubemap, irradiance map, prefiltered specular map, and BRDF LUT from the HDRI
 - Keeps the BRDF debug modes from the previous PBR demo
-- Includes a sample metallic torus model in `assets/models/metallic_torus.gltf`
+- Includes a sample `WaterBottle.glb` model in `assets/models`
 
 ## Supported glTF Subset
 

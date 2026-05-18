@@ -108,6 +108,61 @@ namespace
         return fs::is_regular_file(path, errorCode);
     }
 
+    void AppendUniquePath(std::vector<fs::path>& paths, const fs::path& path)
+    {
+        if (path.empty())
+        {
+            return;
+        }
+
+        if (std::find(paths.begin(), paths.end(), path) == paths.end())
+        {
+            paths.push_back(path);
+        }
+    }
+
+    std::vector<fs::path> GetProjectRootCandidates(const fs::path& executableDirectory)
+    {
+        std::vector<fs::path> projectRoots;
+
+        std::error_code errorCode;
+        const fs::path currentDirectory = fs::current_path(errorCode);
+        if (!currentDirectory.empty())
+        {
+            if (_wcsicmp(currentDirectory.filename().c_str(), L"gltf-metallic-roughness") == 0)
+            {
+                AppendUniquePath(projectRoots, currentDirectory);
+            }
+
+            AppendUniquePath(projectRoots, currentDirectory / L"gltf-metallic-roughness");
+        }
+
+        const fs::path twoLevelsUp = executableDirectory.parent_path().parent_path();
+        if (!twoLevelsUp.empty())
+        {
+            if (_wcsicmp(twoLevelsUp.filename().c_str(), L"gltf-metallic-roughness") == 0)
+            {
+                AppendUniquePath(projectRoots, twoLevelsUp);
+            }
+
+            AppendUniquePath(projectRoots, twoLevelsUp / L"gltf-metallic-roughness");
+        }
+
+        return projectRoots;
+    }
+
+    fs::path GetOutputSubdirectory(const fs::path& executableDirectory)
+    {
+        const fs::path configurationDirectory = executableDirectory.filename();
+        const fs::path platformDirectory = executableDirectory.parent_path().filename();
+        if (configurationDirectory.empty() || platformDirectory.empty())
+        {
+            return {};
+        }
+
+        return platformDirectory / configurationDirectory;
+    }
+
     void AppendHdrFilesFromDirectory(const fs::path& directory, std::vector<fs::path>& files)
     {
         std::error_code errorCode;
@@ -2475,46 +2530,16 @@ HRESULT Renderer::LoadShaderBlob(const wchar_t* compiledShaderName, const wchar_
     *blobOut = nullptr;
 
     const fs::path executableDirectory = GetExecutableDirectory();
-
-    std::error_code errorCode;
-    const fs::path currentDirectory = fs::current_path(errorCode);
-
-    std::vector<fs::path> compiledShaderCandidates;
-    compiledShaderCandidates.emplace_back(executableDirectory / compiledShaderName);
-    if (!currentDirectory.empty())
-    {
-        compiledShaderCandidates.emplace_back(currentDirectory / compiledShaderName);
-    }
-
-    for (const fs::path& shaderPath : compiledShaderCandidates)
-    {
-        if (!FileExists(shaderPath))
-        {
-            continue;
-        }
-
-        const HRESULT hr = D3DReadFileToBlob(shaderPath.c_str(), blobOut);
-        if (SUCCEEDED(hr))
-        {
-            return S_OK;
-        }
-    }
+    const std::vector<fs::path> projectRoots = GetProjectRootCandidates(executableDirectory);
+    const fs::path outputSubdirectory = GetOutputSubdirectory(executableDirectory);
 
     std::vector<fs::path> sourceShaderCandidates;
-    if (!currentDirectory.empty())
+    for (const fs::path& projectRoot : projectRoots)
     {
-        sourceShaderCandidates.emplace_back(currentDirectory / sourceRelativePath);
-        sourceShaderCandidates.emplace_back(currentDirectory / L"ibl-diffuse" / sourceRelativePath);
+        AppendUniquePath(sourceShaderCandidates, projectRoot / sourceRelativePath);
     }
 
-    sourceShaderCandidates.emplace_back(executableDirectory / sourceRelativePath);
-
-    const fs::path twoLevelsUp = executableDirectory.parent_path().parent_path();
-    if (!twoLevelsUp.empty())
-    {
-        sourceShaderCandidates.emplace_back(twoLevelsUp / sourceRelativePath);
-        sourceShaderCandidates.emplace_back(twoLevelsUp / L"ibl-diffuse" / sourceRelativePath);
-    }
+    AppendUniquePath(sourceShaderCandidates, executableDirectory / sourceRelativePath);
 
     for (const fs::path& shaderPath : sourceShaderCandidates)
     {
@@ -2524,6 +2549,45 @@ HRESULT Renderer::LoadShaderBlob(const wchar_t* compiledShaderName, const wchar_
         }
 
         return CompileShader(shaderPath.wstring(), entryPoint, shaderModel, blobOut);
+    }
+
+    std::vector<fs::path> compiledShaderCandidates;
+    if (!outputSubdirectory.empty())
+    {
+        for (const fs::path& projectRoot : projectRoots)
+        {
+            AppendUniquePath(compiledShaderCandidates, projectRoot / outputSubdirectory / compiledShaderName);
+        }
+    }
+
+    AppendUniquePath(compiledShaderCandidates, executableDirectory / compiledShaderName);
+
+    fs::path newestCompiledShaderPath;
+    fs::file_time_type newestWriteTime = fs::file_time_type::min();
+    for (const fs::path& shaderPath : compiledShaderCandidates)
+    {
+        std::error_code errorCode;
+        if (!fs::is_regular_file(shaderPath, errorCode))
+        {
+            continue;
+        }
+
+        const fs::file_time_type writeTime = fs::last_write_time(shaderPath, errorCode);
+        if (errorCode)
+        {
+            continue;
+        }
+
+        if (newestCompiledShaderPath.empty() || writeTime > newestWriteTime)
+        {
+            newestCompiledShaderPath = shaderPath;
+            newestWriteTime = writeTime;
+        }
+    }
+
+    if (!newestCompiledShaderPath.empty())
+    {
+        return D3DReadFileToBlob(newestCompiledShaderPath.c_str(), blobOut);
     }
 
     return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
@@ -2603,25 +2667,15 @@ void Renderer::EndEvent() const
 fs::path Renderer::FindHdriFile() const
 {
     const fs::path executableDirectory = GetExecutableDirectory();
-
-    std::error_code errorCode;
-    const fs::path currentDirectory = fs::current_path(errorCode);
+    const std::vector<fs::path> projectRoots = GetProjectRootCandidates(executableDirectory);
 
     std::vector<fs::path> searchDirectories;
-    searchDirectories.emplace_back(executableDirectory / L"assets" / L"hdri");
-
-    if (!currentDirectory.empty())
+    for (const fs::path& projectRoot : projectRoots)
     {
-        searchDirectories.emplace_back(currentDirectory / L"assets" / L"hdri");
-        searchDirectories.emplace_back(currentDirectory / L"ibl-diffuse" / L"assets" / L"hdri");
+        AppendUniquePath(searchDirectories, projectRoot / L"assets" / L"hdri");
     }
 
-    const fs::path twoLevelsUp = executableDirectory.parent_path().parent_path();
-    if (!twoLevelsUp.empty())
-    {
-        searchDirectories.emplace_back(twoLevelsUp / L"assets" / L"hdri");
-        searchDirectories.emplace_back(twoLevelsUp / L"ibl-diffuse" / L"assets" / L"hdri");
-    }
+    AppendUniquePath(searchDirectories, executableDirectory / L"assets" / L"hdri");
 
     std::vector<fs::path> candidateFiles;
     for (const fs::path& directory : searchDirectories)
@@ -2642,25 +2696,15 @@ fs::path Renderer::FindHdriFile() const
 fs::path Renderer::FindSceneFile() const
 {
     const fs::path executableDirectory = GetExecutableDirectory();
-
-    std::error_code errorCode;
-    const fs::path currentDirectory = fs::current_path(errorCode);
+    const std::vector<fs::path> projectRoots = GetProjectRootCandidates(executableDirectory);
 
     std::vector<fs::path> searchDirectories;
-    searchDirectories.emplace_back(executableDirectory / L"assets" / L"models");
-
-    if (!currentDirectory.empty())
+    for (const fs::path& projectRoot : projectRoots)
     {
-        searchDirectories.emplace_back(currentDirectory / L"assets" / L"models");
-        searchDirectories.emplace_back(currentDirectory / L"ibl-diffuse" / L"assets" / L"models");
+        AppendUniquePath(searchDirectories, projectRoot / L"assets" / L"models");
     }
 
-    const fs::path twoLevelsUp = executableDirectory.parent_path().parent_path();
-    if (!twoLevelsUp.empty())
-    {
-        searchDirectories.emplace_back(twoLevelsUp / L"assets" / L"models");
-        searchDirectories.emplace_back(twoLevelsUp / L"ibl-diffuse" / L"assets" / L"models");
-    }
+    AppendUniquePath(searchDirectories, executableDirectory / L"assets" / L"models");
 
     std::vector<fs::path> candidateFiles;
     for (const fs::path& directory : searchDirectories)
