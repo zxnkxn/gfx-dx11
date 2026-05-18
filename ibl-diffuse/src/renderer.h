@@ -40,7 +40,6 @@ private:
         Geometry = 2,
         Fresnel = 3,
         DirectLighting = 4,
-        AmbientDiffuse = 5,
     };
 
     struct PointLight
@@ -116,7 +115,6 @@ private:
     HRESULT CreateGeometry();
     HRESULT CreateSphereMeshGeometry(UINT latitudeSegments, UINT longitudeSegments, MeshGeometry& geometry, const char* debugName);
     HRESULT CreateEnvironmentCubemap();
-    HRESULT CreateEnvironmentCubemap(const std::filesystem::path& hdriFilePath);
     HRESULT CreateHdriTexture(const struct HdriImage& image);
     HRESULT CreateFloatCubemap(
         UINT faceSize,
@@ -134,12 +132,7 @@ private:
     HRESULT CreateIrradianceMap();
     void CreateSceneObjects();
     void InitializeLights();
-    void RefreshAvailableHdriFiles();
     void UpdateWindowTitle();
-    void ShowControls() const;
-    bool AreAnyPointLightsEnabled() const;
-    void ToggleAllPointLights();
-    HRESULT CycleHdriSelection(int direction);
 
     // Window-size dependent resources
     HRESULT CreateWindowSizeResources();
@@ -165,6 +158,7 @@ private:
     void SetViewport(UINT width, UINT height) const;
     void BeginEvent(const wchar_t* name) const;
     void EndEvent() const;
+    std::filesystem::path FindHdriFile() const;
 
     // Window procedure
     LRESULT HandleWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
@@ -193,12 +187,9 @@ private:
     // Scene state
     std::vector<SphereInstance> m_sphereInstances;
     std::array<PointLight, 3> m_pointLights;
-    std::array<bool, 3> m_pointLightEnabled;
     DisplayMode m_displayMode;
-    bool m_previewIrradianceCubemap;
+    bool m_pointLightsEnabled;
     std::wstring m_loadedHdriFileName;
-    std::vector<std::filesystem::path> m_availableHdriFiles;
-    size_t m_currentHdriFileIndex;
 
     // DirectX core objects
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;

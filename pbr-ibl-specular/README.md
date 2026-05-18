@@ -1,4 +1,4 @@
-# DirectX 11 IBL Diffuse + Specular Application
+# DirectX 11 IBL Diffuse Application
 
 DirectX 11 application rendering a PBR sphere grid with HDRI-based environment lighting.
 
